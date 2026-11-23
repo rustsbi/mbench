@@ -168,16 +168,58 @@ fn validate_run_args(args: &RunArgs) -> Result<(), String> {
     if !args.bios.exists() {
         return Err(format!("BIOS file does not exist: {}", args.bios.display()));
     }
+    if !args.bios.is_file() {
+        return Err(format!(
+            "BIOS path is not a regular file: {}",
+            args.bios.display()
+        ));
+    }
+    if let Some(kernel) = &args.kernel {
+        if !kernel.exists() {
+            return Err(format!("kernel file does not exist: {}", kernel.display()));
+        }
+        if !kernel.is_file() {
+            return Err(format!(
+                "kernel path is not a regular file: {}",
+                kernel.display()
+            ));
+        }
+    }
     if args.smp == 0 {
         return Err(String::from("--smp must be at least 1"));
     }
     if args.max_harts == Some(0) {
         return Err(String::from("--max-harts must be at least 1"));
     }
+    if args.timeout == 0 {
+        return Err(String::from("--timeout must be at least 1 second"));
+    }
     if args.icount && args.smp != 1 {
         return Err(String::from(
             "--icount requires --smp 1 for deterministic single-thread TCG instruction counting",
         ));
+    }
+    if let Some(filter) = &args.filter {
+        if filter.is_empty() {
+            return Err(String::from("--filter must not be empty"));
+        }
+        if filter.chars().any(char::is_whitespace) {
+            return Err(String::from(
+                "--filter must not contain whitespace (bootargs tokens are whitespace-delimited)",
+            ));
+        }
+    }
+    if let Some(name) = &args.name {
+        if name.trim().is_empty() {
+            return Err(String::from("--name must not be empty"));
+        }
+        if args.out.is_none()
+            && (name.contains('/') || name.contains('\\') || name == "." || name == "..")
+        {
+            return Err(String::from(
+                "--name must not contain path separators or '.'/'..' when --out is omitted",
+            ));
+        }
     }
     if let Some(raw_seed) = &args.seed {
         let _ = parse_seed_u64(raw_seed)?;
@@ -248,6 +290,7 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
         mode: Some(args.mode.into_core()),
         order: Some(args.order.into_core()),
         seed: effective_seed,
+        max_harts: args.max_harts,
     };
 
     let mut state = CaptureState {
@@ -461,7 +504,7 @@ impl AttemptTracker {
             }
             Ok(Some(WireFrame::Check(chk))) => {
                 if chk.skip_reason == Some(SkipReason::ResumedPast) {
-                    return LineAction::Continue;
+                    return LineAction::RefreshPhaseIfIdle;
                 }
                 self.active_cases
                     .retain(|s| !(s.kind == StartKind::Check && s.id == chk.id));
@@ -475,7 +518,7 @@ impl AttemptTracker {
             }
             Ok(Some(WireFrame::Bench(b))) => {
                 if b.skip_reason == Some(SkipReason::ResumedPast) {
-                    return LineAction::Continue;
+                    return LineAction::RefreshPhaseIfIdle;
                 }
                 self.active_cases.retain(|s| {
                     !(s.kind == StartKind::Bench && s.id == b.id && s.parallel == b.parallel)
@@ -795,6 +838,7 @@ mod tests {
             mode: Some(RunMode::All),
             order: Some(OrderMode::Shuffle),
             seed: Some(0xdead_beef),
+            max_harts: Some(2),
         })
         .unwrap();
 
@@ -854,5 +898,76 @@ mod tests {
         let end = cap.end.unwrap();
         assert_eq!(end.checks_total, 1);
         assert_eq!(end.checks_failed, 1);
+    }
+
+    #[test]
+    fn validates_run_args_and_refreshes_phase_on_resumed_past() {
+        let existing_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let base_args = || RunArgs {
+            bios: existing_file.clone(),
+            name: Some(String::from("fw")),
+            kernel: None,
+            smp: 4,
+            mode: CliRunMode::All,
+            profile: CliProfile::Quick,
+            order: CliOrder::Fixed,
+            seed: None,
+            filter: None,
+            icount: false,
+            io: false,
+            destructive: false,
+            max_harts: None,
+            timeout: 30,
+            qemu_args: Vec::new(),
+            qemu: String::from("qemu-system-riscv64"),
+            out: None,
+        };
+        assert!(validate_run_args(&base_args()).is_ok());
+
+        let mut bad_timeout = base_args();
+        bad_timeout.timeout = 0;
+        assert!(validate_run_args(&bad_timeout).is_err());
+
+        let mut empty_filter = base_args();
+        empty_filter.filter = Some(String::new());
+        assert!(validate_run_args(&empty_filter).is_err());
+
+        let mut space_filter = base_args();
+        space_filter.filter = Some(String::from("base/ time/"));
+        assert!(validate_run_args(&space_filter).is_err());
+
+        let mut empty_name = base_args();
+        empty_name.name = Some(String::from("   "));
+        assert!(validate_run_args(&empty_name).is_err());
+
+        let mut path_name = base_args();
+        path_name.name = Some(String::from("../escape"));
+        assert!(validate_run_args(&path_name).is_err());
+
+        let mut path_name_with_out = base_args();
+        path_name_with_out.name = Some(String::from("group/label"));
+        path_name_with_out.out = Some(PathBuf::from("out.jsonl"));
+        assert!(validate_run_args(&path_name_with_out).is_ok());
+
+        let mut missing_kernel = base_args();
+        missing_kernel.kernel = Some(existing_file.with_file_name("missing-kernel.bin"));
+        assert!(validate_run_args(&missing_kernel).is_err());
+
+        let mut tracker = AttemptTracker::new();
+        let mut state = CaptureState {
+            frames: Vec::new(),
+            quarantine_warnings: 0,
+        };
+        let chk_resumed = "@@MBENCH:CHECK {\"id\":\"conformance/base\",\"checks\":0,\"checks_total\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}";
+        assert!(matches!(
+            tracker.process_line(chk_resumed, &mut state),
+            LineAction::RefreshPhaseIfIdle
+        ));
+        let bench_resumed = "@@MBENCH:BENCH {\"id\":\"base/get_spec_version\",\"group\":\"base\",\"parallel\":1,\"unit\":\"call\",\"iters_per_trial\":0,\"trials\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}";
+        assert!(matches!(
+            tracker.process_line(bench_resumed, &mut state),
+            LineAction::RefreshPhaseIfIdle
+        ));
+        assert!(state.frames.is_empty());
     }
 }
