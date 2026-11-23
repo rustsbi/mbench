@@ -59,6 +59,11 @@ struct MetricView<'a> {
 }
 
 pub(crate) fn execute(args: CompareArgs) -> Result<(), String> {
+    if let Some(flt) = &args.filter
+        && flt.is_empty()
+    {
+        return Err(String::from("--filter must not be empty"));
+    }
     let mut captures = Vec::with_capacity(args.files.len());
     for path in &args.files {
         let text = fs::read_to_string(path)
@@ -82,16 +87,46 @@ pub(crate) fn render_comparison(
     filter: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    render_metadata_header(captures, &mut out);
-    render_extension_matrix(captures, &mut out);
-    render_conformance_table(captures, format, filter, &mut out);
-    render_benchmark_table(captures, metric, format, filter, &mut out);
-    render_derived_decomposition(captures, metric, format, &mut out);
+    render_metadata_header(captures, format, &mut out);
+    render_extension_matrix(captures, format, &mut out);
+    let drew_checks = render_conformance_table(captures, format, filter, &mut out);
+    let drew_benches = render_benchmark_table(captures, metric, format, filter, &mut out);
+    let drew_derived = render_derived_decomposition(captures, metric, format, filter, &mut out);
+    if let Some(flt) = filter
+        && !drew_checks
+        && !drew_benches
+        && !drew_derived
+    {
+        out.push_str(&format!(
+            "No checks or benchmarks matched filter '{flt}'.\n"
+        ));
+    }
     out
 }
 
-fn render_metadata_header(captures: &[ParsedCapture], out: &mut String) {
-    out.push_str("=== Firmware & Platform Summary ===\n");
+fn write_section_heading(title: &str, format: OutputFormat, out: &mut String) {
+    match format {
+        OutputFormat::Table => {
+            out.push_str("=== ");
+            out.push_str(title);
+            out.push_str(" ===\n");
+        }
+        OutputFormat::Markdown => {
+            out.push_str("## ");
+            out.push_str(title);
+            out.push('\n');
+        }
+    }
+}
+
+fn render_metadata_header(captures: &[ParsedCapture], format: OutputFormat, out: &mut String) {
+    write_section_heading("Firmware & Platform Summary", format, out);
+    let label_w = captures
+        .iter()
+        .map(|c| c.label.len())
+        .max()
+        .unwrap_or(18)
+        .max(18);
     for cap in captures {
         let panic_note = cap
             .panic
@@ -104,6 +139,10 @@ fn render_metadata_header(captures: &[ParsedCapture], out: &mut String) {
                     .unwrap_or("panic");
                 format!(" panic={msg}")
             })
+            .unwrap_or_default();
+        let max_harts_note = cap
+            .max_harts
+            .map(|mh| format!(" max_harts={mh}"))
             .unwrap_or_default();
 
         if let Some(meta) = &cap.meta {
@@ -129,26 +168,34 @@ fn render_metadata_header(captures: &[ParsedCapture], out: &mut String) {
                 .end
                 .as_ref()
                 .map(|e| {
-                    format!(
-                        " checks={}/{} check_fail={} benches={}/{} bench_fail={} warn={}",
+                    let mut s = format!(
+                        " checks={}/{} check_fail={} benches={}/{} bench_fail={}",
                         e.checks_passed,
                         e.checks_total,
                         e.checks_failed,
                         e.benches_passed,
                         e.benches_total,
                         e.benches_failed,
-                        e.quarantine_warnings
-                    )
+                    );
+                    if e.benches_hw_native > 0 {
+                        s.push_str(&format!(" hw_nat={}", e.benches_hw_native));
+                    }
+                    if e.benches_delegated > 0 {
+                        s.push_str(&format!(" deleg={}", e.benches_delegated));
+                    }
+                    s.push_str(&format!(" warn={}", e.quarantine_warnings));
+                    s
                 })
                 .unwrap_or_default();
             out.push_str(&format!(
-                "- {:<18} sbi=v{}.{} impl={} (ver={:#x}) harts={} timebase={}Hz sstc={} h={} console={} boot_ticks={} resv={}B regime={} ({cal_note}{end_note}{panic_note})\n",
+                "- {:<w$} sbi=v{}.{} impl={} (ver={:#x}) harts={}{} timebase={}Hz sstc={} h={} console={} boot_ticks={} resv={}B regime={} ({cal_note}{end_note}{panic_note})\n",
                 cap.label,
                 major,
                 minor,
                 meta.impl_id,
                 meta.impl_version,
                 meta.hart_count,
+                max_harts_note,
                 meta.timebase_hz,
                 meta.has_sstc,
                 meta.has_h_ext,
@@ -156,28 +203,33 @@ fn render_metadata_header(captures: &[ParsedCapture], out: &mut String) {
                 meta.boot_ticks,
                 meta.reserved_mem_bytes,
                 cap.clock_regime.label(),
+                w = label_w,
             ));
         } else {
             out.push_str(&format!(
-                "- {:<18} (no META frame; regime={}{})\n",
+                "- {:<w$} (no META frame; regime={}{})\n",
                 cap.label,
                 cap.clock_regime.label(),
                 panic_note,
+                w = label_w,
             ));
         }
     }
     out.push('\n');
 }
 
-fn render_extension_matrix(captures: &[ParsedCapture], out: &mut String) {
-    out.push_str("=== SBI v3.0 Extension Matrix ===\n");
-    out.push_str(&format!("{:<18}", "Firmware"));
+fn render_extension_matrix(captures: &[ParsedCapture], format: OutputFormat, out: &mut String) {
+    write_section_heading("SBI v3.0 Extension Matrix", format, out);
+    let mut headers = Vec::with_capacity(1 + SbiExtensionId::ALL.len());
+    headers.push(String::from("Firmware"));
     for ext in SbiExtensionId::ALL {
-        out.push_str(&format!(" {:<5}", ext.name()));
+        headers.push(String::from(ext.name()));
     }
-    out.push('\n');
+
+    let mut rows = Vec::with_capacity(captures.len());
     for cap in captures {
-        out.push_str(&format!("{:<18}", cap.label));
+        let mut row = Vec::with_capacity(headers.len());
+        row.push(cap.label.clone());
         let mask = cap.meta.as_ref().map_or(0, |m| m.extensions_mask);
         for ext in SbiExtensionId::ALL {
             let mark = if (mask & ext.as_flag().bits()) != 0 {
@@ -185,10 +237,12 @@ fn render_extension_matrix(captures: &[ParsedCapture], out: &mut String) {
             } else {
                 "-"
             };
-            out.push_str(&format!(" {:<5}", mark));
+            row.push(String::from(mark));
         }
-        out.push('\n');
+        rows.push(row);
     }
+
+    write_table(&headers, &rows, format, out);
     out.push('\n');
 }
 
@@ -197,7 +251,7 @@ fn render_conformance_table(
     format: OutputFormat,
     filter: Option<&str>,
     out: &mut String,
-) {
+) -> bool {
     let mut keys: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for cap in captures {
@@ -213,7 +267,7 @@ fn render_conformance_table(
         }
     }
     if keys.is_empty() {
-        return;
+        return false;
     }
 
     let lookup: Vec<BTreeMap<&str, &CheckFrame>> = captures
@@ -221,7 +275,7 @@ fn render_conformance_table(
         .map(|cap| cap.checks.iter().map(|c| (c.id.as_str(), c)).collect())
         .collect();
 
-    out.push_str("=== Functional Conformance Summary ===\n");
+    write_section_heading("Functional Conformance Summary", format, out);
     let mut headers = vec![String::from("Check")];
     for cap in captures {
         headers.push(cap.label.clone());
@@ -242,6 +296,7 @@ fn render_conformance_table(
 
     write_table(&headers, &rows, format, out);
     out.push('\n');
+    true
 }
 
 fn format_check_cell(chk: &CheckFrame) -> String {
@@ -281,7 +336,7 @@ fn render_benchmark_table(
     format: OutputFormat,
     filter: Option<&str>,
     out: &mut String,
-) {
+) -> bool {
     let mut keys: Vec<(String, usize)> = Vec::new();
     let mut seen: BTreeSet<(String, usize)> = BTreeSet::new();
     for cap in captures {
@@ -298,7 +353,7 @@ fn render_benchmark_table(
         }
     }
     if keys.is_empty() {
-        return;
+        return false;
     }
 
     let lookup: Vec<BTreeMap<(&str, usize), &BenchFrame>> = captures
@@ -317,9 +372,10 @@ fn render_benchmark_table(
         Metric::Ns => "ns",
     };
 
-    out.push_str(&format!(
-        "=== Benchmark Comparison (metric: {metric_name}, median [iqr], Mann-Whitney U alpha=0.05) ===\n"
-    ));
+    let heading = format!(
+        "Benchmark Comparison (metric: {metric_name}, median [iqr], Mann-Whitney U alpha=0.05)"
+    );
+    write_section_heading(&heading, format, out);
 
     let mut headers = vec![
         String::from("Benchmark"),
@@ -356,14 +412,16 @@ fn render_benchmark_table(
 
     write_table(&headers, &rows, format, out);
     out.push('\n');
+    true
 }
 
 fn render_derived_decomposition(
     captures: &[ParsedCapture],
     metric: Metric,
     format: OutputFormat,
+    filter: Option<&str>,
     out: &mut String,
-) {
+) -> bool {
     let derived_defs = [
         (
             "m_mode_ecall_overhead",
@@ -391,6 +449,13 @@ fn render_derived_decomposition(
 
     let mut rows = Vec::new();
     for (name, lhs_id, rhs_id) in derived_defs {
+        if let Some(flt) = filter
+            && !name.contains(flt)
+            && !lhs_id.contains(flt)
+            && !rhs_id.contains(flt)
+        {
+            continue;
+        }
         let mut row = vec![String::from(name), format!("{lhs_id} - {rhs_id}")];
         let mut any_present = false;
         for cap in captures {
@@ -414,11 +479,13 @@ fn render_derived_decomposition(
         }
     }
 
-    if !rows.is_empty() {
-        out.push_str("=== Derived Cost Decomposition ===\n");
-        write_table(&headers, &rows, format, out);
-        out.push('\n');
+    if rows.is_empty() {
+        return false;
     }
+    write_section_heading("Derived Cost Decomposition", format, out);
+    write_table(&headers, &rows, format, out);
+    out.push('\n');
+    true
 }
 
 fn find_bench_median(
@@ -715,5 +782,69 @@ mod tests {
             render_comparison(&[panic_only], Metric::Cycles, OutputFormat::Table, None);
         assert!(panic_report.contains("no META frame"));
         assert!(panic_report.contains("panic=unexpected trap"));
+    }
+
+    #[test]
+    fn renders_markdown_extension_matrix_aligns_long_labels_and_filters_derived() {
+        let mut long_raw = String::from(
+            "# MBENCH_ENV {\"clock_regime\":\"qemu-icount\",\"label\":\"opensbi-smp1-icount\",\"smp\":1,\"icount\":true,\"max_harts\":1}\n",
+        );
+        long_raw.push_str(&sample_capture_text(
+            &[118, 119, 120, 121, 122],
+            &[48, 49, 50, 51, 52],
+        ));
+        let mut cap_long = parse_capture("fallback", &long_raw).unwrap();
+        if let Some(end) = &mut cap_long.end {
+            end.benches_hw_native = 2;
+        }
+
+        let md = render_comparison(
+            std::slice::from_ref(&cap_long),
+            Metric::Cycles,
+            OutputFormat::Markdown,
+            None,
+        );
+        assert!(md.contains("## Firmware & Platform Summary"));
+        assert!(md.contains("## SBI v3.0 Extension Matrix"));
+        assert!(md.contains("| Firmware            | base | time |"));
+        assert!(md.contains("| opensbi-smp1-icount | Y    | Y    |"));
+        assert!(md.contains("max_harts=1"));
+        assert!(md.contains("hw_nat=2"));
+
+        let table = render_comparison(
+            std::slice::from_ref(&cap_long),
+            Metric::Cycles,
+            OutputFormat::Table,
+            None,
+        );
+        let fw_line = table
+            .lines()
+            .find(|l| l.starts_with("Firmware "))
+            .expect("table header");
+        let val_line = table
+            .lines()
+            .find(|l| l.starts_with("opensbi-smp1-icount "))
+            .expect("table row");
+        assert_eq!(fw_line.find("base"), val_line.find("Y"));
+
+        let filtered_base = render_comparison(
+            std::slice::from_ref(&cap_long),
+            Metric::Cycles,
+            OutputFormat::Table,
+            Some("base/get_spec_version"),
+        );
+        assert!(filtered_base.contains("m_mode_ecall_overhead"));
+        assert!(!filtered_base.contains("cold_icache_penalty\n"));
+
+        let filtered_empty = render_comparison(
+            &[cap_long],
+            Metric::Cycles,
+            OutputFormat::Table,
+            Some("__no_match__"),
+        );
+        assert!(!filtered_empty.contains("Functional Conformance Summary"));
+        assert!(!filtered_empty.contains("Benchmark Comparison"));
+        assert!(!filtered_empty.contains("Derived Cost Decomposition"));
+        assert!(filtered_empty.contains("No checks or benchmarks matched filter '__no_match__'."));
     }
 }
