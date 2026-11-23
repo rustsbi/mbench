@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mbench-core",
+]
+# Keep default cargo test/clippy on host-testable safe crates; build mbench-target
+# explicitly for `riscv64imac-unknown-none-elf`.
+default-members = [
+    "crates/mbench-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+redundant_imports = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+allow_attributes = "warn"
+dbg_macro = "warn"
+inconsistent_struct_constructor = "warn"
+needless_continue = "warn"
+redundant_closure_for_method_calls = "warn"
+redundant_test_prefix = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+
+[workspace.dependencies]
+anofox-statistics = "0.10.1"
+bitflags = { version = "2.9", default-features = false }
+clap = { version = "4.5", features = ["derive"] }
+fdt = "0.1.5"
+mbench-core = { path = "crates/mbench-core" }
+riscv = { version = "0.15.0", features = ["s-mode"] }
+sbi-rt = { version = "0.0.3", features = ["legacy", "integer-impls"] }
+sbi-spec = "0.0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true
