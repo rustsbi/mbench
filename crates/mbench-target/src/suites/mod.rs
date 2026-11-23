@@ -5,6 +5,9 @@
 pub(crate) mod baseline;
 pub(crate) mod ext_base;
 pub(crate) mod ext_hsm;
+pub(crate) mod ext_rfnc;
+pub(crate) mod ext_scale;
+pub(crate) mod ext_spi;
 pub(crate) mod ext_time;
 
 use core::fmt::Write;
@@ -13,7 +16,7 @@ use mbench_core::{
     config::RunConfig,
     engine::{self, BenchSpec},
     protocol,
-    record::RunState,
+    record::{RunState, SbiExtensionId},
 };
 
 use crate::platform::Platform;
@@ -81,8 +84,42 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
 
         // Phase 2: Single-hart SBI extensions.
         run_bench_slice(&SINGLE_HART_SPECS, platform, &mut state, seed ^ 2);
+    }
 
-        // Phase 4: HSM lifecycle suite (secondary harts STOPPED).
+    // Phase 3: Multi-hart worker pool (sPI, RFNC, ParallelSweep scaling).
+    let mut smp_started = false;
+    let mut smp_bringup_ok = true;
+    if cfg.mode.runs_benches()
+        && platform.info().hart_count > 1
+        && platform.caps().extensions.contains_ext(SbiExtensionId::Hsm)
+    {
+        match platform.bringup_secondary_harts() {
+            Ok(_) => {
+                smp_started = true;
+            }
+            Err(err) => {
+                smp_bringup_ok = false;
+                let _ = writeln!(
+                    &mut con,
+                    "[mbench] warn: secondary hart bringup failed: {err:?}"
+                );
+            }
+        }
+    }
+
+    if smp_bringup_ok && cfg.mode.runs_benches() {
+        run_bench_slice(&MULTI_HART_SPECS, platform, &mut state, seed ^ 3);
+    }
+
+    if smp_started && let Err(err) = platform.stop_secondary_harts() {
+        let _ = writeln!(
+            &mut con,
+            "[mbench] warn: secondary hart stop_all failed: {err:?}"
+        );
+    }
+
+    // Phase 4: HSM lifecycle suite (secondary harts STOPPED).
+    if cfg.mode.runs_benches() {
         run_bench_slice(ext_hsm::SPECS, platform, &mut state, seed ^ 4);
     }
 
@@ -129,6 +166,9 @@ fn run_bench_slice(
 const SINGLE_HART_LEN: usize = ext_base::SPECS.len() + ext_time::SPECS.len();
 const SINGLE_HART_SPECS: [BenchSpec<Platform>; SINGLE_HART_LEN] =
     concat_specs(&[ext_base::SPECS, ext_time::SPECS]);
+
+const MULTI_HART_SPECS: [BenchSpec<Platform>; 19] =
+    concat_specs(&[ext_spi::SPECS, ext_rfnc::SPECS, ext_scale::SPECS]);
 
 const fn concat_specs<const N: usize>(
     groups: &[&[BenchSpec<Platform>]],
