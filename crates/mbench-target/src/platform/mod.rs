@@ -6,14 +6,20 @@ pub(crate) mod counters;
 pub(crate) mod dtb;
 pub(crate) mod hsm;
 pub(crate) mod icache;
+pub(crate) mod misalign;
 pub(crate) mod mmu;
+pub(crate) mod shmem;
 pub(crate) mod smp;
+pub(crate) mod sse;
+pub(crate) mod susp;
 pub(crate) mod timer;
 pub(crate) mod trap;
 
 use mbench_core::{
     engine::{Clock, CounterSnap, HartCoordinator, ParallelSample, ParallelWorkFn},
-    record::{CounterAvailability, FailReason, HartTopology, MetaRecord, SbiExtensionId},
+    record::{
+        CounterAvailability, FailReason, HartTopology, MetaRecord, SbiExtensionId, SkipReason,
+    },
 };
 use riscv::register::{sie, sip, sstatus};
 
@@ -22,12 +28,15 @@ use self::{
     counters::RiscvCounters,
     dtb::HardwareInfo,
     hsm::{HsmSuspendProbe, HsmSuspendWorker, SuspendWakeMode},
+    misalign::MisalignProbe,
     mmu::{SatpTarget, Sv39Config},
+    shmem::{DbtrAcquire, ShmemAcquire, ShmemLease, ShmemOwner, ShmemPool},
     smp::HsmHartPool,
+    sse::SseSession,
     timer::TimerMode,
     trap::TrapHookMode,
 };
-use crate::sbi::{self, SbiCaps, SbiRet};
+use crate::sbi::{self, SbiCaps, SbiError, SbiRet};
 
 /// Encapsulated S-mode runtime environment passed to conformance checks and benchmark suites.
 pub(crate) struct Platform {
@@ -36,6 +45,7 @@ pub(crate) struct Platform {
     pub(in crate::platform) console: ConsoleBackend,
     pub(in crate::platform) counters: RiscvCounters,
     pub(in crate::platform) harts: HsmHartPool,
+    pub(in crate::platform) shmem: ShmemPool,
     sv39: Sv39Config,
     sv39_active: bool,
     sv39_faulted: bool,
@@ -262,6 +272,8 @@ impl Platform {
         let counters = RiscvCounters::probe(&caps, info.timebase_hz);
         // SAFETY: Called once during single-hart BSP boot before any AP or Sv39 activation.
         let sv39 = unsafe { mmu::init_sv39_identity_table() };
+        // SAFETY: Constructed once during BSP boot for exclusive runtime ownership.
+        let shmem = unsafe { ShmemPool::take_once() };
         let harts = HsmHartPool::new(&info, counters.availability(), sv39);
 
         let pmu_counter_count = if caps.extensions.contains_ext(SbiExtensionId::Pmu) {
@@ -280,6 +292,7 @@ impl Platform {
             console,
             counters,
             harts,
+            shmem,
             sv39,
             sv39_active: false,
             sv39_faulted: false,
@@ -485,6 +498,56 @@ impl Platform {
         }
     }
 
+    /// Exclusively leases the static shared-memory pool for `owner`.
+    pub(crate) fn lease_shmem(
+        &mut self,
+        owner: ShmemOwner,
+    ) -> Result<ShmemAcquire<'_>, FailReason> {
+        ShmemLease::acquire(self, owner)
+    }
+
+    /// Starts an exclusive DBTR shared-memory and hardware debug trigger session.
+    pub(crate) fn start_dbtr_session(&mut self) -> Result<DbtrAcquire<'_>, FailReason> {
+        shmem::DbtrSession::start(self)
+    }
+
+    /// Runs non-short-circuiting boundary security checks for `target` shared-memory registration.
+    pub(crate) fn probe_shmem_security(
+        &mut self,
+        target: ShmemOwner,
+        ctx: &mut mbench_core::check::CheckCtx,
+    ) -> Result<bool, FailReason> {
+        let mmode_addr = self.info.mmode_reserved_addr;
+        shmem::probe_security(self, target, mmode_addr, ctx)
+    }
+
+    /// Queries `sbi_pmu_event_get_info` using exclusive scratch memory at `byte_offset`.
+    pub(crate) fn probe_pmu_event_get_info(
+        &mut self,
+        entries: &mut [sbi::pmu::EventInfoEntry],
+        flags: usize,
+        byte_offset: usize,
+    ) -> Result<SbiRet, FailReason> {
+        shmem::probe_pmu_event_get_info(self, entries, flags, byte_offset)
+    }
+
+    /// Configures a wake-up device before `sbi_system_suspend(SUSPEND_TO_RAM)` when available.
+    pub(crate) fn arm_system_suspend_wake_source(&mut self) -> Result<(), SkipReason> {
+        // Per SBI v3.0 ext-sys-suspend.adoc, caller must configure a wake-up device prior to suspend;
+        // QEMU `virt` / `mbench-target` currently provisions no wake-capable platform device driver.
+        Err(SkipReason::WakeSourceUnavailable)
+    }
+
+    /// Probes `sbi_system_suspend` with the reserved invalid sleep type under full resume context protection.
+    pub(crate) fn probe_invalid_sleep_type(&mut self) -> Result<isize, FailReason> {
+        susp::probe_invalid_sleep_type(self)
+    }
+
+    /// Probes invalid `sbi_sse_register` call (unaligned PC or invalid event ID).
+    pub(crate) fn probe_sse_invalid_register(&self, event_id: usize, unaligned: bool) -> SbiRet {
+        sse::probe_invalid_register(event_id, unaligned)
+    }
+
     /// Probes `sbi_hart_suspend` on `peer_hart_id` and returns observed state.
     pub(crate) fn probe_secondary_suspend(
         &mut self,
@@ -576,6 +639,31 @@ impl Platform {
             ret,
             before == mmu::TARGET_PAGE_SENTINEL && after == mmu::ALT_PAGE_SENTINEL,
         ))
+    }
+
+    /// Grants exclusive BSP access to the misaligned load/store probe buffer.
+    pub(crate) fn misalign_probe(&mut self) -> MisalignProbe<'_> {
+        MisalignProbe::new(self)
+    }
+
+    /// Registers `EVENT_LOCAL_SOFTWARE` on BSP and returns an RAII [`SseSession`].
+    pub(crate) fn register_local_sse(&mut self) -> Result<SseSession<'_>, SbiError> {
+        SseSession::register_local(self)
+    }
+
+    /// Probes `ATTR_STATUS` of `EVENT_LOCAL_SOFTWARE` prior to registration.
+    pub(crate) fn probe_sse_local_status(&mut self) -> Result<usize, SbiError> {
+        sse::probe_local_status(self)
+    }
+
+    /// Probes reading attributes for an unknown SSE event using exclusive scratch shmem.
+    pub(crate) fn probe_sse_unknown_event(&mut self) -> SbiRet {
+        sse::probe_unknown_event(self)
+    }
+
+    /// Executes `sbi_system_suspend` exclusively from single-hart BSP state.
+    pub(crate) fn system_suspend(&mut self, sleep_type: u32) -> Result<isize, FailReason> {
+        susp::call_system_suspend(self, sleep_type)
     }
 
     /// Starts a single-instance secondary HSM suspend worker for `peer_hart_id`.
@@ -671,8 +759,12 @@ impl Platform {
             }
         }
 
-        // 6. Audit PMU taint state.
-        if self.has_tainted_pmu_counters() {
+        // 6. Audit shared-memory pool lease/poison, DBTR leak, and PMU taint state.
+        if self.shmem.is_poisoned()
+            || self.shmem.is_registered()
+            || self.shmem.has_leaked_dbtr_trigger()
+            || self.has_tainted_pmu_counters()
+        {
             warnings += 1;
         }
 
