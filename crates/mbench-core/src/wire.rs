@@ -22,6 +22,8 @@ pub struct EnvLine {
     pub order: Option<OrderMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_harts: Option<usize>,
 }
 
 /// Deserialized `@@MBENCH:META` payload.
@@ -250,6 +252,7 @@ pub enum WireFrame {
 pub struct ParsedCapture {
     pub label: String,
     pub clock_regime: ClockRegime,
+    pub max_harts: Option<usize>,
     pub meta: Option<MetaFrame>,
     pub cal: Option<CalFrame>,
     pub cals: Vec<CalFrame>,
@@ -325,6 +328,7 @@ pub fn parse_wire_line(raw_line: &str) -> Result<Option<WireFrame>, String> {
 pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, String> {
     let mut label = default_label.to_string();
     let mut clock_regime = ClockRegime::Unknown;
+    let mut max_harts = None;
     let mut meta = None;
     let mut cal = None;
     let mut cals: Vec<CalFrame> = Vec::new();
@@ -345,6 +349,9 @@ pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, S
         match frame {
             WireFrame::Env(env) => {
                 clock_regime = env.clock_regime;
+                if env.max_harts.is_some() {
+                    max_harts = env.max_harts;
+                }
                 if let Some(lbl) = env.label
                     && !lbl.is_empty()
                 {
@@ -365,7 +372,9 @@ pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, S
             }
             WireFrame::Start(_) => {}
             WireFrame::Check(chk) => {
-                if chk.skip_reason == Some(SkipReason::ResumedPast) && !check_map.is_empty() {
+                if chk.skip_reason == Some(SkipReason::ResumedPast)
+                    && check_map.contains_key(&chk.id)
+                {
                     continue;
                 }
                 if !check_map.contains_key(&chk.id) {
@@ -374,11 +383,11 @@ pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, S
                 check_map.insert(chk.id.clone(), chk);
             }
             WireFrame::Bench(mut b) => {
-                if b.skip_reason == Some(SkipReason::ResumedPast) && !bench_map.is_empty() {
+                let key = (b.id.clone(), b.parallel);
+                if b.skip_reason == Some(SkipReason::ResumedPast) && bench_map.contains_key(&key) {
                     continue;
                 }
                 b.cal_index = active_cal_index;
-                let key = (b.id.clone(), b.parallel);
                 if !bench_map.contains_key(&key) {
                     bench_order.push(key.clone());
                 }
@@ -405,6 +414,7 @@ pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, S
     Ok(ParsedCapture {
         label,
         clock_regime,
+        max_harts,
         meta,
         cal,
         cals,
@@ -422,10 +432,11 @@ fn validate_check_frame(frame: &CheckFrame) -> Result<(), String> {
             if frame.skip_reason.is_some()
                 || frame.fail_reason.is_some()
                 || frame.checks_failed > 0
+                || frame.quirks > 0
                 || has_failure_issue
             {
                 return Err(format!(
-                    "CHECK PASS frame '{}' carries skip/fail reason or failure issue",
+                    "CHECK PASS frame '{}' carries skip/fail reason, quirks, or failure issue",
                     frame.id
                 ));
             }
@@ -434,10 +445,11 @@ fn validate_check_frame(frame: &CheckFrame) -> Result<(), String> {
             if frame.skip_reason.is_none()
                 || frame.fail_reason.is_some()
                 || frame.checks_failed > 0
+                || frame.quirks > 0
                 || has_failure_issue
             {
                 return Err(format!(
-                    "CHECK SKIPPED frame '{}' has invalid reason or failure fields",
+                    "CHECK SKIPPED frame '{}' has invalid reason, quirks, or failure fields",
                     frame.id
                 ));
             }
@@ -829,5 +841,51 @@ mod tests {
              \"status\":\"PASS\",\"issues\":[{\"label\":\"bad\",\"class\":\"spec_violation\",\"reason\":\"timeout\"}]}"
         )
         .is_err());
+
+        // PASS and SKIPPED frames with nonzero quirks must be rejected.
+        assert!(
+            parse_wire_line(
+                "@@MBENCH:CHECK {\"id\":\"x\",\"checks\":1,\"checks_total\":1,\"status\":\"PASS\",\"quirks\":1}"
+            )
+            .is_err()
+        );
+        assert!(parse_wire_line(
+            "@@MBENCH:CHECK {\"id\":\"x\",\"checks\":0,\"checks_total\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"filtered_out\",\"quirks\":1}"
+        )
+        .is_err());
+
+        // EnvLine with max_harts round-trips while older captures omit it cleanly.
+        let env_with_mh = parse_capture(
+            "mh",
+            "# MBENCH_ENV {\"clock_regime\":\"qemu-tcg-non-cycle-accurate\",\"label\":\"mh\",\"smp\":4,\"max_harts\":2}\n\
+             @@MBENCH:CHECK {\"id\":\"conformance/base\",\"checks\":1,\"checks_total\":1,\"status\":\"PASS\"}\n",
+        )
+        .unwrap();
+        assert_eq!(env_with_mh.max_harts, Some(2));
+        assert_eq!(cap.max_harts, None);
+
+        // ResumedPast preserves unmatched records but never overwrites an existing prior result for the same key.
+        let mut resumed_raw = String::from(
+            "@@MBENCH:CHECK {\"id\":\"conformance/base\",\"checks\":5,\"checks_total\":5,\"status\":\"PASS\"}\n\
+             @@MBENCH:CHECK {\"id\":\"conformance/base\",\"checks\":0,\"checks_total\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}\n\
+             @@MBENCH:CHECK {\"id\":\"conformance/time\",\"checks\":0,\"checks_total\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}\n",
+        );
+        let resumed_bench = "@@MBENCH:BENCH {\"id\":\"base/get_spec_version\",\"group\":\"base\",\"mode\":\"batched\",\"parallel\":1,\"unit\":\"call\",\"iters_per_trial\":16,\"trials\":5,\"status\":\"PASS\"}\n\
+             @@MBENCH:BENCH {\"id\":\"base/get_spec_version\",\"group\":\"base\",\"parallel\":1,\"unit\":\"call\",\"iters_per_trial\":0,\"trials\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}\n\
+             @@MBENCH:BENCH {\"id\":\"base/probe.hit\",\"group\":\"base\",\"parallel\":1,\"unit\":\"call\",\"iters_per_trial\":0,\"trials\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}\n";
+        resumed_raw.push_str(resumed_bench);
+        let resumed_cap = parse_capture("resumed", &resumed_raw).unwrap();
+        assert_eq!(resumed_cap.checks.len(), 2);
+        assert_eq!(resumed_cap.checks[0].status, CheckStatusTag::Pass);
+        assert_eq!(
+            resumed_cap.checks[1].skip_reason,
+            Some(SkipReason::ResumedPast)
+        );
+        assert_eq!(resumed_cap.benches.len(), 2);
+        assert_eq!(resumed_cap.benches[0].status, BenchStatusTag::Pass);
+        assert_eq!(
+            resumed_cap.benches[1].skip_reason,
+            Some(SkipReason::ResumedPast)
+        );
     }
 }
