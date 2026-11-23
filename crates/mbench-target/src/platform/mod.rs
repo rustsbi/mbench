@@ -282,10 +282,6 @@ impl Platform {
             0
         };
 
-        let raw_load_addr = option_env!("MBENCH_LOAD_ADDR").unwrap_or("0x80200000");
-        let load_addr = usize::from_str_radix(raw_load_addr.trim_start_matches("0x"), 16)
-            .unwrap_or(0x8020_0000);
-
         Self {
             info,
             caps,
@@ -300,7 +296,7 @@ impl Platform {
             pmu_tainted_mask: 0,
             pmu_tainted_overflow: false,
             boot_ticks: boot::boot_ticks(),
-            load_addr,
+            load_addr: boot::LOAD_ADDR,
         }
     }
 

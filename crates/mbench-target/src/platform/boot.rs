@@ -19,6 +19,41 @@ const RISCV_HEADER_VERSION: u32 = 0x2;
 const RISCV_IMAGE_MAGIC: u64 = 0x0056_4353_4952; // "RISCV" little-endian
 const RISCV_IMAGE_MAGIC2: u32 = 0x0543_5352; // "RSC\x05" little-endian
 
+const fn parse_hex_u64(raw: &str) -> u64 {
+    let bytes = raw.as_bytes();
+    let mut i = if bytes.len() >= 2 && bytes[0] == b'0' && (bytes[1] == b'x' || bytes[1] == b'X') {
+        2
+    } else {
+        0
+    };
+    assert!(i < bytes.len(), "empty hexadecimal literal");
+    let mut acc = 0u64;
+    while i < bytes.len() {
+        let digit = match bytes[i] {
+            b'0'..=b'9' => (bytes[i] - b'0') as u64,
+            b'a'..=b'f' => (bytes[i] - b'a' + 10) as u64,
+            b'A'..=b'F' => (bytes[i] - b'A' + 10) as u64,
+            _ => panic!("invalid hex digit"),
+        };
+        acc = acc
+            .checked_mul(16)
+            .expect("hex literal overflow")
+            .checked_add(digit)
+            .expect("hex literal overflow");
+        i += 1;
+    }
+    acc
+}
+
+/// Configured S-mode physical load address injected by `build.rs`.
+pub(crate) const LOAD_ADDR: usize = parse_hex_u64(env!("MBENCH_LOAD_ADDR")) as usize;
+const RISCV_TEXT_OFFSET: u64 = parse_hex_u64(env!("MBENCH_TEXT_OFFSET"));
+
+const _: () = assert!(parse_hex_u64("0x80200000") == 0x8020_0000);
+const _: () = assert!(parse_hex_u64("0X400000") == 0x40_0000);
+const _: () = assert!(LOAD_ADDR != 0 && (LOAD_ADDR & 0xfff) == 0);
+const _: () = assert!((RISCV_TEXT_OFFSET & 0xfff) == 0);
+
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub(crate) struct AlignedStack([u8; HART_STACK_SIZE]);
@@ -135,7 +170,7 @@ unsafe extern "C" fn mbench_boot_header() -> ! {
         ".option pop",
         ".word 0",
         ".balign 8",
-        ".dword 0x200000",
+        ".dword {text_offset}",
         ".dword __image_end - __image_start",
         ".dword 0",
         ".word {header_version}",
@@ -145,6 +180,7 @@ unsafe extern "C" fn mbench_boot_header() -> ! {
         ".balign 4",
         ".word {magic2}",
         ".word 0",
+        text_offset = const RISCV_TEXT_OFFSET,
         header_version = const RISCV_HEADER_VERSION,
         magic1 = const RISCV_IMAGE_MAGIC,
         magic2 = const RISCV_IMAGE_MAGIC2,
