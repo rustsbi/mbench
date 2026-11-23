@@ -2,9 +2,12 @@
 
 mod base;
 mod dbcn;
+mod fwft;
 mod hsm;
+mod pmu;
 mod rfnc;
 mod spi;
+mod system;
 mod time;
 mod traps;
 
@@ -47,8 +50,20 @@ pub(crate) static SINGLE_HART_GROUPS: &[CheckGroup<'static, Platform>] = &[
         cases: rfnc::SINGLE_CASES,
     },
     CheckGroup {
+        name: "pmu",
+        cases: pmu::CASES,
+    },
+    CheckGroup {
         name: "dbcn",
         cases: dbcn::CASES,
+    },
+    CheckGroup {
+        name: "fwft",
+        cases: fwft::CASES,
+    },
+    CheckGroup {
+        name: "system",
+        cases: system::CASES,
     },
     CheckGroup {
         name: "traps",
