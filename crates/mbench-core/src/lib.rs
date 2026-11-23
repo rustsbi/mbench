@@ -3,6 +3,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod check;
 pub mod config;
 pub mod isa;
 pub mod protocol;
