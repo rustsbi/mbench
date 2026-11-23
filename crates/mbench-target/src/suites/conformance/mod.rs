@@ -2,11 +2,14 @@
 
 mod base;
 mod dbcn;
+mod dbtr;
 mod fwft;
 mod hsm;
 mod pmu;
 mod rfnc;
+mod shmem_security;
 mod spi;
+mod sse;
 mod system;
 mod time;
 mod traps;
@@ -60,6 +63,18 @@ pub(crate) static SINGLE_HART_GROUPS: &[CheckGroup<'static, Platform>] = &[
     CheckGroup {
         name: "fwft",
         cases: fwft::CASES,
+    },
+    CheckGroup {
+        name: "dbtr",
+        cases: dbtr::CASES,
+    },
+    CheckGroup {
+        name: "sse",
+        cases: sse::CASES,
+    },
+    CheckGroup {
+        name: "shmem_security",
+        cases: shmem_security::CASES,
     },
     CheckGroup {
         name: "system",
