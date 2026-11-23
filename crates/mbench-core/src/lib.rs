@@ -8,3 +8,5 @@ pub mod isa;
 pub mod protocol;
 pub mod record;
 pub mod stats;
+#[cfg(feature = "std")]
+pub mod wire;
