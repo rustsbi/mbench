@@ -21,10 +21,10 @@ use core::fmt::Write;
 
 use mbench_core::{
     check,
-    config::RunConfig,
+    config::{RunConfig, effective_max_harts},
     engine::{self, BenchSpec},
     protocol,
-    record::{RunState, SbiExtensionId},
+    record::{BenchGroup, RunState, SbiCapMask, SbiExtensionId},
 };
 
 use crate::platform::Platform;
@@ -53,17 +53,32 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
     let mut con = platform.console();
     let meta = platform.meta_record();
     let _ = protocol::write_meta_line(&meta, &mut con);
-    let _ = writeln!(
-        &mut con,
-        "[mbench] boot: mode={} harts={} timebase={}Hz console={} sstc={} h={} sbi={:#x}",
-        cfg.mode.as_str(),
-        meta.hart_count,
-        meta.timebase_hz,
-        meta.console_backend,
-        meta.has_sstc,
-        meta.has_h_ext,
-        meta.sbi_spec_version,
-    );
+    if let Some(mh) = cfg.max_harts {
+        let _ = writeln!(
+            &mut con,
+            "[mbench] boot: mode={} harts={} max_harts={} timebase={}Hz console={} sstc={} h={} sbi={:#x}",
+            cfg.mode.as_str(),
+            meta.hart_count,
+            mh,
+            meta.timebase_hz,
+            meta.console_backend,
+            meta.has_sstc,
+            meta.has_h_ext,
+            meta.sbi_spec_version,
+        );
+    } else {
+        let _ = writeln!(
+            &mut con,
+            "[mbench] boot: mode={} harts={} timebase={}Hz console={} sstc={} h={} sbi={:#x}",
+            cfg.mode.as_str(),
+            meta.hart_count,
+            meta.timebase_hz,
+            meta.console_backend,
+            meta.has_sstc,
+            meta.has_h_ext,
+            meta.sbi_spec_version,
+        );
+    }
 
     let mut state = RunState::new(cfg, platform.caps().extensions);
     let seed = cfg
@@ -99,13 +114,11 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
     }
 
     // Phase 3: Multi-hart worker pool (SMP conformance checks, sPI, RFNC, ParallelSweep scaling).
+    let effective_harts = effective_max_harts(platform.info().hart_count, cfg.max_harts);
     let mut smp_started = false;
     let mut smp_bringup_ok = true;
-    if (cfg.mode.runs_checks() || cfg.mode.runs_benches())
-        && platform.info().hart_count > 1
-        && platform.caps().extensions.contains_ext(SbiExtensionId::Hsm)
-    {
-        match platform.bringup_secondary_harts() {
+    if any_multi_hart_work(&cfg, platform.caps().extensions, effective_harts) {
+        match platform.bringup_secondary_harts(effective_harts) {
             Ok(_) => {
                 smp_started = true;
             }
@@ -199,6 +212,38 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
     );
 
     platform.shutdown()
+}
+
+fn any_multi_hart_work(cfg: &RunConfig<'_>, exts: SbiCapMask, effective_harts: usize) -> bool {
+    if effective_harts <= 1 || !exts.contains_ext(SbiExtensionId::Hsm) {
+        return false;
+    }
+    let matches_filter = |id: &str| cfg.filter.is_none_or(|flt| id.contains(flt));
+    let has_ext = |req: Option<SbiExtensionId>| req.is_none_or(|ext| exts.contains_ext(ext));
+
+    if cfg.mode.runs_checks() {
+        for group in conformance::MULTI_HART_GROUPS {
+            for case in group.cases {
+                if case.meta.gate.min_harts >= 2
+                    && has_ext(case.meta.gate.required_ext)
+                    && matches_filter(case.meta.id)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    if cfg.mode.runs_benches() {
+        for spec in MULTI_HART_SPECS {
+            if (spec.meta.min_harts >= 2 || spec.meta.group == BenchGroup::Scale)
+                && has_ext(spec.meta.required_ext)
+                && matches_filter(spec.meta.id)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn run_check_groups(

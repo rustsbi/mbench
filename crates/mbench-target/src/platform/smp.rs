@@ -171,12 +171,13 @@ impl HsmHartPool {
         self.dedicated_worker_hart = None;
     }
 
-    /// Starts secondary harts `1..total_harts` into the parked pool via SBI HSM.
-    pub(crate) fn bringup_all(&mut self) -> Result<usize, FailReason> {
+    /// Starts up to `max_total_harts` (capped at `total_harts`) secondary harts into the parked pool.
+    pub(crate) fn bringup_up_to(&mut self, max_total_harts: usize) -> Result<usize, FailReason> {
         if self.poisoned || self.dedicated_worker_hart.is_some() {
             return Err(FailReason::HardwareInconsistent);
         }
-        if self.total_harts <= 1 {
+        let target_total = self.total_harts.min(max_total_harts);
+        if target_total <= 1 {
             self.active_workers = 0;
             return Ok(1);
         }
@@ -184,7 +185,7 @@ impl HsmHartPool {
         START_BARRIER.store(self.next_epoch << 1, Ordering::Release);
 
         let mut online = 1usize;
-        for slot_idx in 1..self.total_harts {
+        for slot_idx in 1..target_total {
             let slot = slot_ref(slot_idx);
             let hid = self.hart_ids[slot_idx];
             slot.hart_id.store(hid, Ordering::Relaxed);

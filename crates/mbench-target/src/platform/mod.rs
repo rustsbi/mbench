@@ -351,8 +351,11 @@ impl Platform {
         self.harts.hart_id(slot_idx)
     }
 
-    pub(crate) fn bringup_secondary_harts(&mut self) -> Result<usize, FailReason> {
-        self.harts.bringup_all()
+    pub(crate) fn bringup_secondary_harts(
+        &mut self,
+        max_total_harts: usize,
+    ) -> Result<usize, FailReason> {
+        self.harts.bringup_up_to(max_total_harts)
     }
 
     pub(crate) fn stop_secondary_harts(&mut self) -> Result<(), FailReason> {

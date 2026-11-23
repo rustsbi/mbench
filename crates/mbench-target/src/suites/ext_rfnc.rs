@@ -35,10 +35,10 @@ pub(crate) static SPECS: &[BenchSpec<Platform>] = &[
     rfnc_spec("rfnc/sfence_vma.all", 2, run_sfence_all),
     rfnc_spec("rfnc/sfence_vma_asid.page.all", 2, run_sfence_asid_page_all),
     rfnc_spec("rfnc/sfence_vma_asid.all", 2, run_sfence_asid_all),
-    rfnc_spec("rfnc/hfence_gvma", 1, run_hfence_gvma),
-    rfnc_spec("rfnc/hfence_gvma_vmid", 1, run_hfence_gvma_vmid),
-    rfnc_spec("rfnc/hfence_vvma", 1, run_hfence_vvma),
-    rfnc_spec("rfnc/hfence_vvma_asid", 1, run_hfence_vvma_asid),
+    rfnc_spec("rfnc/hfence_gvma", 2, run_hfence_gvma),
+    rfnc_spec("rfnc/hfence_gvma_vmid", 2, run_hfence_gvma_vmid),
+    rfnc_spec("rfnc/hfence_vvma", 2, run_hfence_vvma),
+    rfnc_spec("rfnc/hfence_vvma_asid", 2, run_hfence_vvma_asid),
 ];
 
 const fn rfnc_spec(
