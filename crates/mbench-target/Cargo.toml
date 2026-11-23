@@ -1,0 +1,16 @@
+[package]
+name = "mbench-target"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+fdt.workspace = true
+mbench-core.workspace = true
+riscv.workspace = true
+sbi-rt.workspace = true
+sbi-spec.workspace = true
+
+[lints]
+workspace = true

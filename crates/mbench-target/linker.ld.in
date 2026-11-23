@@ -1,0 +1,45 @@
+OUTPUT_ARCH(riscv)
+ENTRY(mbench_bsp_start)
+
+SECTIONS {
+    . = @MBENCH_LOAD_ADDR@;
+    __image_start = .;
+
+    .head.text : ALIGN(8) {
+        KEEP(*(.head.text))
+    }
+
+    .text : ALIGN(4096) {
+        *(.text.entry)
+        . = ALIGN(4096);
+        *(.text.icache_thrash)
+        *(.text .text.*)
+    }
+
+    .rodata : ALIGN(8) {
+        *(.rodata .rodata.*)
+        *(.srodata .srodata.*)
+    }
+
+    .data : ALIGN(8) {
+        *(.data .data.*)
+        *(.sdata .sdata.*)
+    }
+
+    .bss (NOLOAD) : ALIGN(4096) {
+        *(.bss.uninit)
+        . = ALIGN(8);
+        __sbss = .;
+        *(.bss .bss.*)
+        *(.sbss .sbss.*)
+        . = ALIGN(8);
+        __ebss = .;
+    }
+
+    . = ALIGN(4096);
+    __image_end = .;
+
+    /DISCARD/ : {
+        *(.eh_frame)
+    }
+}

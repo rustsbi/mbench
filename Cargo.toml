@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/mbench-core",
+    "crates/mbench-target",
     "crates/mbench-cli",
 ]
 # Keep default cargo test/clippy on host-testable safe crates; build mbench-target
