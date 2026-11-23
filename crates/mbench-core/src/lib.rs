@@ -5,3 +5,4 @@
 
 pub mod config;
 pub mod isa;
+pub mod stats;
