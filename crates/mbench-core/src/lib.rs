@@ -5,4 +5,6 @@
 
 pub mod config;
 pub mod isa;
+pub mod protocol;
+pub mod record;
 pub mod stats;
