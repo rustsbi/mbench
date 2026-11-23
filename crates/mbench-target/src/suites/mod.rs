@@ -4,13 +4,17 @@
 
 pub(crate) mod baseline;
 pub(crate) mod ext_base;
+pub(crate) mod ext_dbtr;
 pub(crate) mod ext_hsm;
+pub(crate) mod ext_mpxy;
 pub(crate) mod ext_pmu;
 pub(crate) mod ext_rfnc;
 pub(crate) mod ext_scale;
 pub(crate) mod ext_spi;
+pub(crate) mod ext_sse;
 pub(crate) mod ext_sys;
 pub(crate) mod ext_time;
+pub(crate) mod traps_emul;
 
 use core::fmt::Write;
 
@@ -84,7 +88,7 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
         // Phase 1: Calibration baselines.
         run_bench_slice(baseline::SPECS, platform, &mut state, seed ^ 1);
 
-        // Phase 2: Single-hart SBI extensions.
+        // Phase 2: Single-hart SBI extensions & implicit trap-and-emulate suite.
         run_bench_slice(&SINGLE_HART_SPECS, platform, &mut state, seed ^ 2);
     }
 
@@ -173,15 +177,15 @@ fn run_bench_slice(
     );
 }
 
-const SINGLE_HART_LEN: usize = ext_base::SPECS.len()
-    + ext_time::SPECS.len()
-    + ext_pmu::SPECS.len()
-    + ext_sys::SINGLE_HART_SPECS.len();
-const SINGLE_HART_SPECS: [BenchSpec<Platform>; SINGLE_HART_LEN] = concat_specs(&[
+const SINGLE_HART_SPECS: [BenchSpec<Platform>; 43] = concat_specs(&[
     ext_base::SPECS,
     ext_time::SPECS,
     ext_pmu::SPECS,
     ext_sys::SINGLE_HART_SPECS,
+    ext_sse::SPECS,
+    ext_dbtr::SPECS,
+    ext_mpxy::SPECS,
+    traps_emul::SPECS,
 ]);
 
 const MULTI_HART_SPECS: [BenchSpec<Platform>; 19] =
