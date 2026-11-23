@@ -2,6 +2,9 @@
 
 mod base;
 mod dbcn;
+mod hsm;
+mod rfnc;
+mod spi;
 mod time;
 mod traps;
 
@@ -36,6 +39,14 @@ pub(crate) static SINGLE_HART_GROUPS: &[CheckGroup<'static, Platform>] = &[
         cases: time::CASES,
     },
     CheckGroup {
+        name: "spi",
+        cases: spi::SINGLE_CASES,
+    },
+    CheckGroup {
+        name: "rfnc",
+        cases: rfnc::SINGLE_CASES,
+    },
+    CheckGroup {
         name: "dbcn",
         cases: dbcn::CASES,
     },
@@ -46,7 +57,19 @@ pub(crate) static SINGLE_HART_GROUPS: &[CheckGroup<'static, Platform>] = &[
 ];
 
 /// Conformance groups executed once the Phase 3 SMP worker pool is online.
-pub(crate) static MULTI_HART_GROUPS: &[CheckGroup<'static, Platform>] = &[];
+pub(crate) static MULTI_HART_GROUPS: &[CheckGroup<'static, Platform>] = &[
+    CheckGroup {
+        name: "spi_smp",
+        cases: spi::MULTI_CASES,
+    },
+    CheckGroup {
+        name: "rfnc_smp",
+        cases: rfnc::MULTI_CASES,
+    },
+];
 
 /// HSM conformance checks executed while secondary harts are `STOPPED` (Phase 4).
-pub(crate) static HSM_GROUPS: &[CheckGroup<'static, Platform>] = &[];
+pub(crate) static HSM_GROUPS: &[CheckGroup<'static, Platform>] = &[CheckGroup {
+    name: "hsm",
+    cases: hsm::CASES,
+}];
