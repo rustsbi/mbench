@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub(crate) mod baseline;
+pub(crate) mod conformance;
 pub(crate) mod ext_base;
 pub(crate) mod ext_dbtr;
 pub(crate) mod ext_hsm;
@@ -19,6 +20,7 @@ pub(crate) mod traps_emul;
 use core::fmt::Write;
 
 use mbench_core::{
+    check,
     config::RunConfig,
     engine::{self, BenchSpec},
     protocol,
@@ -68,6 +70,10 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
         .seed
         .unwrap_or_else(|| platform.boot_ticks() ^ (platform.info().hart_count as u64));
 
+    if cfg.mode.runs_checks() {
+        run_check_groups(conformance::SINGLE_HART_GROUPS, platform, &mut state);
+    }
+
     if cfg.mode.runs_benches() {
         let cal = engine::calibrate(platform, cfg.profile, empty_bench_loop);
         let _ = protocol::write_cal_line(&cal, &mut con);
@@ -92,10 +98,10 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
         run_bench_slice(&SINGLE_HART_SPECS, platform, &mut state, seed ^ 2);
     }
 
-    // Phase 3: Multi-hart worker pool (sPI, RFNC, ParallelSweep scaling).
+    // Phase 3: Multi-hart worker pool (SMP conformance checks, sPI, RFNC, ParallelSweep scaling).
     let mut smp_started = false;
     let mut smp_bringup_ok = true;
-    if cfg.mode.runs_benches()
+    if (cfg.mode.runs_checks() || cfg.mode.runs_benches())
         && platform.info().hart_count > 1
         && platform.caps().extensions.contains_ext(SbiExtensionId::Hsm)
     {
@@ -109,12 +115,37 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
                     &mut con,
                     "[mbench] warn: secondary hart bringup failed: {err:?}"
                 );
+                if cfg.mode.runs_checks() {
+                    check::emit_synthetic_check_result(
+                        "conformance/smp_bringup",
+                        "smp_bringup_failed",
+                        err,
+                        Some("secondary-hart-bringup-failed"),
+                        &mut state,
+                        &mut con,
+                    );
+                }
+                if cfg.mode.runs_benches() {
+                    engine::emit_failed_benches(
+                        &MULTI_HART_SPECS,
+                        platform,
+                        &mut state,
+                        &mut con,
+                        err,
+                        "secondary-hart-bringup-failed",
+                    );
+                }
             }
         }
     }
 
-    if smp_bringup_ok && cfg.mode.runs_benches() {
-        run_bench_slice(&MULTI_HART_SPECS, platform, &mut state, seed ^ 3);
+    if smp_bringup_ok {
+        if cfg.mode.runs_checks() {
+            run_check_groups(conformance::MULTI_HART_GROUPS, platform, &mut state);
+        }
+        if cfg.mode.runs_benches() {
+            run_bench_slice(&MULTI_HART_SPECS, platform, &mut state, seed ^ 3);
+        }
     }
 
     if smp_started && let Err(err) = platform.stop_secondary_harts() {
@@ -122,9 +153,20 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
             &mut con,
             "[mbench] warn: secondary hart stop_all failed: {err:?}"
         );
+        check::emit_synthetic_check_result(
+            "conformance/smp_stop",
+            "smp_stop_failed",
+            err,
+            Some("secondary-hart-stop-failed"),
+            &mut state,
+            &mut con,
+        );
     }
 
-    // Phase 4: HSM lifecycle suite (secondary harts STOPPED).
+    // Phase 4: HSM conformance & lifecycle suite (secondary harts STOPPED).
+    if cfg.mode.runs_checks() {
+        run_check_groups(conformance::HSM_GROUPS, platform, &mut state);
+    }
     if cfg.mode.runs_benches() {
         run_bench_slice(ext_hsm::SPECS, platform, &mut state, seed ^ 4);
 
@@ -157,6 +199,21 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
     );
 
     platform.shutdown()
+}
+
+fn run_check_groups(
+    groups: &[check::CheckGroup<'_, Platform>],
+    platform: &mut Platform,
+    state: &mut RunState<'_>,
+) {
+    let mut con = platform.console();
+    check::execute_check_groups(
+        groups,
+        platform,
+        state,
+        &mut con,
+        Platform::quarantine_reset,
+    );
 }
 
 fn run_bench_slice(
