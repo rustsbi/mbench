@@ -67,7 +67,7 @@ mbench run --bios /path/to/fw_dynamic.bin --mode check
 # Benchmarks only, quick profile (5 trials instead of 11), filtered by prefix
 mbench run --bios /path/to/fw_dynamic.bin --mode bench --profile quick --filter rfnc/
 
-# Randomized case order with a reproducible seed (helps detect order bias)
+# Randomized benchmark order with a reproducible seed (helps detect order bias)
 mbench run --bios /path/to/fw_dynamic.bin --order shuffle --seed 0x1234
 
 # Include opt-in I/O (DBCN) and destructive (SUSP) benchmarks
@@ -117,7 +117,7 @@ Use any prefix below with `--filter`:
 
 To run `mbench` on a physical RISC-V board (or a custom QEMU command) without `mbench run`:
 
-1. Build the standalone S-mode binary (set `MBENCH_LOAD_ADDR` if your board loads the S-mode payload at a different address; default is `0x80200000`):
+1. Build the standalone S-mode binary (set `MBENCH_LOAD_ADDR` if your board loads the S-mode payload at a different 4 KiB-aligned address; default is `0x80200000`, and the RISC-V boot header `text_offset` defaults to `MBENCH_LOAD_ADDR - 0x80000000` or can be overridden via `MBENCH_TEXT_OFFSET`):
 
 ```bash
 MBENCH_LOAD_ADDR=0x80200000 cargo build --release -p mbench-target --target riscv64imac-unknown-none-elf
@@ -125,6 +125,8 @@ llvm-objcopy -O binary \
   target/riscv64imac-unknown-none-elf/release/mbench-target \
   target/riscv64imac-unknown-none-elf/release/mbench.bin
 ```
+
+*(Note: `mbench.bin` embeds the computed `Image` header `text_offset` for `Image`-aware bootloaders such as U-Boot `booti`. On QEMU `virt` with `-bios`, QEMU ignores `Image.text_offset` on raw binaries and loads them at `0x80200000`, so pass the linked ELF `target/riscv64imac-unknown-none-elf/release/mbench-target` to `--kernel` when booting a non-default `MBENCH_LOAD_ADDR`.)*
 
 2. Boot `mbench.bin` as the S-mode payload behind your M-mode firmware. Optional parameters can be passed via `/chosen/bootargs`:
 
