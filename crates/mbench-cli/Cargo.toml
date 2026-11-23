@@ -1,0 +1,18 @@
+[package]
+name = "mbench-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mbench"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+mbench-core = { workspace = true, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
