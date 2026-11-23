@@ -3,6 +3,9 @@
 #![forbid(unsafe_code)]
 
 pub(crate) mod baseline;
+pub(crate) mod ext_base;
+pub(crate) mod ext_hsm;
+pub(crate) mod ext_time;
 
 use core::fmt::Write;
 
@@ -75,6 +78,12 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
 
         // Phase 1: Calibration baselines.
         run_bench_slice(baseline::SPECS, platform, &mut state, seed ^ 1);
+
+        // Phase 2: Single-hart SBI extensions.
+        run_bench_slice(&SINGLE_HART_SPECS, platform, &mut state, seed ^ 2);
+
+        // Phase 4: HSM lifecycle suite (secondary harts STOPPED).
+        run_bench_slice(ext_hsm::SPECS, platform, &mut state, seed ^ 4);
     }
 
     // Phase 6: Final summary frame and clean SRST shutdown.
@@ -115,4 +124,30 @@ fn run_bench_slice(
         seed,
         Platform::quarantine_reset,
     );
+}
+
+const SINGLE_HART_LEN: usize = ext_base::SPECS.len() + ext_time::SPECS.len();
+const SINGLE_HART_SPECS: [BenchSpec<Platform>; SINGLE_HART_LEN] =
+    concat_specs(&[ext_base::SPECS, ext_time::SPECS]);
+
+const fn concat_specs<const N: usize>(
+    groups: &[&[BenchSpec<Platform>]],
+) -> [BenchSpec<Platform>; N] {
+    assert!(N > 0, "empty benchmark group");
+    let first = groups[0][0];
+    let mut out = [first; N];
+    let mut dst = 0usize;
+    let mut g = 0usize;
+    while g < groups.len() {
+        let slice = groups[g];
+        let mut i = 0usize;
+        while i < slice.len() {
+            out[dst] = slice[i];
+            dst += 1;
+            i += 1;
+        }
+        g += 1;
+    }
+    assert!(dst == N, "concat_specs length mismatch");
+    out
 }
