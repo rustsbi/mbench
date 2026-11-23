@@ -5,9 +5,11 @@
 pub(crate) mod baseline;
 pub(crate) mod ext_base;
 pub(crate) mod ext_hsm;
+pub(crate) mod ext_pmu;
 pub(crate) mod ext_rfnc;
 pub(crate) mod ext_scale;
 pub(crate) mod ext_spi;
+pub(crate) mod ext_sys;
 pub(crate) mod ext_time;
 
 use core::fmt::Write;
@@ -121,6 +123,14 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
     // Phase 4: HSM lifecycle suite (secondary harts STOPPED).
     if cfg.mode.runs_benches() {
         run_bench_slice(ext_hsm::SPECS, platform, &mut state, seed ^ 4);
+
+        // Phase 5: Opt-in I/O (DBCN) and destructive (SUSP) benchmarks.
+        run_bench_slice(
+            ext_sys::IO_DESTRUCTIVE_SPECS,
+            platform,
+            &mut state,
+            seed ^ 5,
+        );
     }
 
     // Phase 6: Final summary frame and clean SRST shutdown.
@@ -163,9 +173,16 @@ fn run_bench_slice(
     );
 }
 
-const SINGLE_HART_LEN: usize = ext_base::SPECS.len() + ext_time::SPECS.len();
-const SINGLE_HART_SPECS: [BenchSpec<Platform>; SINGLE_HART_LEN] =
-    concat_specs(&[ext_base::SPECS, ext_time::SPECS]);
+const SINGLE_HART_LEN: usize = ext_base::SPECS.len()
+    + ext_time::SPECS.len()
+    + ext_pmu::SPECS.len()
+    + ext_sys::SINGLE_HART_SPECS.len();
+const SINGLE_HART_SPECS: [BenchSpec<Platform>; SINGLE_HART_LEN] = concat_specs(&[
+    ext_base::SPECS,
+    ext_time::SPECS,
+    ext_pmu::SPECS,
+    ext_sys::SINGLE_HART_SPECS,
+]);
 
 const MULTI_HART_SPECS: [BenchSpec<Platform>; 19] =
     concat_specs(&[ext_spi::SPECS, ext_rfnc::SPECS, ext_scale::SPECS]);
