@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod compare;
 mod run;
 mod runner;
 
@@ -23,12 +24,15 @@ struct Cli {
 enum Command {
     /// Builds (if needed) and runs `mbench` on QEMU with watchdog & crash recovery.
     Run(run::RunArgs),
+    /// Compares multiple `.jsonl` results or raw serial capture logs side-by-side.
+    Compare(compare::CompareArgs),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let res = match cli.command {
         Command::Run(args) => run::execute(args),
+        Command::Compare(args) => compare::execute(args),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,
