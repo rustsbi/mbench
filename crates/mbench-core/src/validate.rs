@@ -8,7 +8,8 @@ use crate::{
     record::{BenchGroup, EndRecord, SkipReason, StartKind},
     wire::{
         AttemptRecord, BenchFrame, BenchStatusTag, CheckFrame, CheckStatusTag, EndFrame, EnvLine,
-        MetaFrame, PanicFrame, StartFrame, WireFrame, parse_wire_line,
+        MetaFrame, PanicFrame, StartFrame, WireFrame, parse_wire_line, shutdown_fail_reason,
+        synthesize_fail_bench, synthesize_fail_check,
     },
 };
 
@@ -250,19 +251,18 @@ pub fn audit_raw_attempt(raw_lines: &[String], expect_end: bool) -> Vec<String> 
 /// Always retains all validly parsed facts even when malformed lines or truncated attempts occur.
 pub fn audit_capture(source: &str, text: &str) -> CaptureReport {
     let lines: Vec<&str> = text.lines().collect();
-    let is_merged = lines
-        .iter()
-        .any(|line| line.starts_with("# MBENCH_ENV ") || line.starts_with("# MBENCH_ATTEMPT "));
-
-    if is_merged {
-        return audit_merged_jsonl(source, &lines);
-    }
-
     let has_raw_attempt_markers = lines
         .iter()
         .any(|line| line.starts_with("# MBENCH_RAW_ATTEMPT "));
     if has_raw_attempt_markers {
         return audit_multi_attempt_raw(source, &lines);
+    }
+
+    let is_merged = lines
+        .iter()
+        .any(|line| line.starts_with("# MBENCH_ENV ") || line.starts_with("# MBENCH_ATTEMPT "));
+    if is_merged {
+        return audit_merged_jsonl(source, &lines);
     }
 
     audit_single_attempt_raw(source, &lines)
@@ -274,13 +274,44 @@ fn audit_single_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
     if !parsed.any_frame_seen && protocol_errors.is_empty() {
         protocol_errors.push(format!("no @@MBENCH frames found in '{source}'"));
     }
+
+    let mut check_order = Vec::new();
+    let mut check_map = BTreeMap::new();
+    let mut bench_order = Vec::new();
+    let mut bench_map = BTreeMap::new();
+    for chk in parsed.checks {
+        merge_check_into(&mut check_order, &mut check_map, chk);
+    }
+    for bench in parsed.benches {
+        merge_bench_into(&mut bench_order, &mut bench_map, bench);
+    }
+    merge_synthesized_unclosed(
+        &mut check_order,
+        &mut check_map,
+        &mut bench_order,
+        &mut bench_map,
+        &parsed.unclosed_at_end,
+        "protocol_error",
+    );
+    let eof_reason = if parsed.saw_panic {
+        "crash"
+    } else {
+        "incomplete"
+    };
+    merge_synthesized_unclosed(
+        &mut check_order,
+        &mut check_map,
+        &mut bench_order,
+        &mut bench_map,
+        &parsed.unclosed_at_eof,
+        eof_reason,
+    );
+    let checks = finalize_check_order(check_order, &mut check_map);
+    let benches = finalize_bench_order(bench_order, &mut bench_map);
+
     let completed = parsed.any_frame_seen && parsed.end.is_some() && parsed.panic.is_none();
     let quarantine = parsed.end.map_or(0, |e| e.quarantine_warnings);
-    let counts = CaptureCounts::from_end(&summarize_records(
-        &parsed.checks,
-        &parsed.benches,
-        quarantine,
-    ));
+    let counts = CaptureCounts::from_end(&summarize_records(&checks, &benches, quarantine));
 
     build_report(
         source.to_string(),
@@ -294,8 +325,8 @@ fn audit_single_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
         parsed.end,
         counts,
         Vec::new(),
-        parsed.checks,
-        parsed.benches,
+        checks,
+        benches,
     )
 }
 
@@ -356,6 +387,7 @@ fn audit_multi_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
     let total_sections = sections.len();
     let mut any_frame_seen = false;
     let mut latest_env = None;
+    let mut all_attempts = Vec::new();
     let mut latest_meta = None;
     let mut latest_panic = None;
     let mut last_end = None;
@@ -376,6 +408,20 @@ fn audit_multi_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
         };
         for err in sec.errors {
             protocol_errors.push(format!("{prefix}: {err}"));
+        }
+
+        if sec.attempts.len() > 1 {
+            protocol_errors.push(format!(
+                "{prefix}: multiple # MBENCH_ATTEMPT records inside single attempt"
+            ));
+        }
+        if let (Some(expected), Some(rec)) = (attempt_num, sec.attempts.first())
+            && rec.attempt != expected
+        {
+            protocol_errors.push(format!(
+                "{prefix}: mismatched # MBENCH_ATTEMPT index {} (expected {expected})",
+                rec.attempt
+            ));
         }
 
         any_frame_seen |= sec.any_frame_seen;
@@ -400,6 +446,29 @@ fn audit_multi_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
         for bench in sec.benches {
             merge_bench_into(&mut bench_order, &mut bench_map, bench);
         }
+        merge_synthesized_unclosed(
+            &mut check_order,
+            &mut check_map,
+            &mut bench_order,
+            &mut bench_map,
+            &sec.unclosed_at_end,
+            "protocol_error",
+        );
+        let eof_reason = sec
+            .attempts
+            .last()
+            .map_or(if sec.saw_panic { "crash" } else { "incomplete" }, |rec| {
+                shutdown_fail_reason(&rec.shutdown)
+            });
+        merge_synthesized_unclosed(
+            &mut check_order,
+            &mut check_map,
+            &mut bench_order,
+            &mut bench_map,
+            &sec.unclosed_at_eof,
+            eof_reason,
+        );
+        all_attempts.extend(sec.attempts);
         if is_last {
             last_saw_end = sec.end.is_some();
             last_saw_panic = sec.saw_panic;
@@ -413,7 +482,8 @@ fn audit_multi_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
     let checks = finalize_check_order(check_order, &mut check_map);
     let benches = finalize_bench_order(bench_order, &mut bench_map);
     let counts = CaptureCounts::from_end(&summarize_records(&checks, &benches, total_quarantine));
-    let completed = any_frame_seen && last_saw_end && !last_saw_panic;
+    let last_attempt_complete = all_attempts.last().is_none_or(|attempt| attempt.saw_end);
+    let completed = any_frame_seen && last_saw_end && !last_saw_panic && last_attempt_complete;
     let recovered = total_sections > 1;
 
     build_report(
@@ -427,7 +497,7 @@ fn audit_multi_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
         latest_panic,
         last_end,
         counts,
-        Vec::new(),
+        all_attempts,
         checks,
         benches,
     )
@@ -557,6 +627,8 @@ struct StreamAuditResult {
     panic: Option<PanicFrame>,
     end: Option<EndFrame>,
     saw_panic: bool,
+    unclosed_at_end: Vec<StartFrame>,
+    unclosed_at_eof: Vec<StartFrame>,
     checks: Vec<CheckFrame>,
     benches: Vec<BenchFrame>,
 }
@@ -576,6 +648,7 @@ fn audit_stream_lines(
     let mut end = None;
 
     let mut tracker = CaseTracker::new();
+    let mut unclosed_at_end = Vec::new();
     let mut raw_checks: Vec<CheckFrame> = Vec::new();
     let mut raw_benches: Vec<BenchFrame> = Vec::new();
     let mut seen_check_keys: BTreeMap<String, usize> = BTreeMap::new();
@@ -752,6 +825,7 @@ fn audit_stream_lines(
                             "line {line_no}: unclosed @@MBENCH:START frame before END ({:?} '{}', parallel={})",
                             unclosed.kind, unclosed.id, unclosed.parallel
                         ));
+                        unclosed_at_end.push(unclosed);
                     }
                     if raw_single_attempt {
                         let computed = summarize_records(
@@ -780,6 +854,7 @@ fn audit_stream_lines(
         }
     }
 
+    let unclosed_at_eof = tracker.drain_all();
     if expect_end {
         if meta_count == 0 && !saw_panic {
             errors.push(String::from("missing @@MBENCH:META frame"));
@@ -787,7 +862,7 @@ fn audit_stream_lines(
         if !saw_end {
             errors.push(String::from("missing @@MBENCH:END frame"));
         }
-        for unclosed in tracker.drain_all() {
+        for unclosed in &unclosed_at_eof {
             errors.push(format!(
                 "unclosed @@MBENCH:START frame at EOF ({:?} '{}', parallel={})",
                 unclosed.kind, unclosed.id, unclosed.parallel
@@ -804,12 +879,53 @@ fn audit_stream_lines(
         panic,
         end,
         saw_panic,
+        unclosed_at_end,
+        unclosed_at_eof,
         checks: finalize_check_order(check_order, &mut check_map),
         benches: finalize_bench_order(bench_order, &mut bench_map),
     }
 }
 
-fn merge_check_into(
+pub(crate) fn merge_synthesized_unclosed(
+    check_order: &mut Vec<String>,
+    check_map: &mut BTreeMap<String, CheckFrame>,
+    bench_order: &mut Vec<(String, usize)>,
+    bench_map: &mut BTreeMap<(String, usize), BenchFrame>,
+    unclosed: &[StartFrame],
+    reason: &str,
+) {
+    for start in unclosed {
+        match start.kind {
+            StartKind::Check => {
+                if !check_map
+                    .get(&start.id)
+                    .is_some_and(|existing| existing.skip_reason != Some(SkipReason::ResumedPast))
+                {
+                    merge_check_into(
+                        check_order,
+                        check_map,
+                        synthesize_fail_check(&start.id, reason),
+                    );
+                }
+            }
+            StartKind::Bench => {
+                let key = (start.id.clone(), start.parallel);
+                if !bench_map
+                    .get(&key)
+                    .is_some_and(|existing| existing.skip_reason != Some(SkipReason::ResumedPast))
+                {
+                    merge_bench_into(
+                        bench_order,
+                        bench_map,
+                        synthesize_fail_bench(&start.id, start.parallel, reason),
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn merge_check_into(
     order: &mut Vec<String>,
     map: &mut BTreeMap<String, CheckFrame>,
     chk: CheckFrame,
@@ -823,7 +939,7 @@ fn merge_check_into(
     map.insert(chk.id.clone(), chk);
 }
 
-fn merge_bench_into(
+pub(crate) fn merge_bench_into(
     order: &mut Vec<(String, usize)>,
     map: &mut BTreeMap<(String, usize), BenchFrame>,
     bench: BenchFrame,
@@ -838,14 +954,14 @@ fn merge_bench_into(
     map.insert(key, bench);
 }
 
-fn finalize_check_order(
+pub(crate) fn finalize_check_order(
     order: Vec<String>,
     map: &mut BTreeMap<String, CheckFrame>,
 ) -> Vec<CheckFrame> {
     order.into_iter().filter_map(|id| map.remove(&id)).collect()
 }
 
-fn finalize_bench_order(
+pub(crate) fn finalize_bench_order(
     order: Vec<(String, usize)>,
     map: &mut BTreeMap<(String, usize), BenchFrame>,
 ) -> Vec<BenchFrame> {
@@ -1125,6 +1241,15 @@ mod tests {
         assert_eq!(corrupt_report.checks.len(), 1);
         assert_eq!(corrupt_report.checks[0].id, "conformance/base");
         assert_eq!(corrupt_report.counts.checks_passed, 1);
+        assert_eq!(corrupt_report.benches.len(), 1);
+        assert_eq!(corrupt_report.benches[0].id, "base/probe");
+        assert_eq!(corrupt_report.benches[0].status, BenchStatusTag::Fail);
+        assert_eq!(
+            corrupt_report.benches[0].fail_reason.as_deref(),
+            Some("protocol_error")
+        );
+        assert!(corrupt_report.benches[0].synthetic);
+        assert_eq!(corrupt_report.counts.benches_failed, 1);
         assert!(corrupt_report.end.is_some());
         assert!(corrupt_report.completed);
 
@@ -1228,7 +1353,16 @@ mod tests {
         assert!(rep.recovered);
         assert!(rep.meta.is_some());
         assert_eq!(rep.counts.benches_passed, 2);
-        assert_eq!(rep.counts.benches_skipped, 1);
+        assert_eq!(rep.counts.benches_failed, 1);
+        assert_eq!(rep.counts.benches_skipped, 0);
+        let counter = rep
+            .benches
+            .iter()
+            .find(|b| b.id == "baseline/counter")
+            .expect("baseline/counter retained");
+        assert_eq!(counter.status, BenchStatusTag::Fail);
+        assert_eq!(counter.fail_reason.as_deref(), Some("incomplete"));
+        assert!(counter.synthetic);
         assert!(
             rep.protocol_errors
                 .iter()
@@ -1241,6 +1375,79 @@ mod tests {
             "second attempt META must not be flagged as duplicate META: {:?}",
             rep.protocol_errors
         );
+
+        // Clean crash recovery with # MBENCH_ATTEMPT footers must remain protocol_valid,
+        // preserve attempt closure records, and retain the crashed case as synthetic FAIL("crash").
+        let mut clean_crash_raw = String::from("# MBENCH_RAW_ATTEMPT {\"attempt\":0}\n");
+        clean_crash_raw.push_str(&sample_meta(1, SbiCapMask::BASE));
+        clean_crash_raw.push_str(
+            "@@MBENCH:START {\"kind\":\"bench\",\"id\":\"baseline/loop\",\"parallel\":1}\n",
+        );
+        let att0 = AttemptRecord {
+            attempt: 0,
+            resume_after: None,
+            saw_end: false,
+            shutdown: ShutdownStatus::Signaled,
+            protocol_errors: vec![String::from("missing @@MBENCH:END frame")],
+            synthesized_failures: vec![String::from("baseline/loop")],
+        };
+        clean_crash_raw.push_str(&format!(
+            "# MBENCH_ATTEMPT {}\n",
+            serde_json::to_string(&att0).unwrap()
+        ));
+        clean_crash_raw
+            .push_str("# MBENCH_RAW_ATTEMPT {\"attempt\":1,\"resume_after\":\"baseline/loop\"}\n");
+        clean_crash_raw.push_str(&sample_meta(1, SbiCapMask::BASE));
+        clean_crash_raw.push_str(&bench_line(
+            "baseline/loop",
+            BenchGroup::Baseline,
+            1,
+            BenchStatus::Skipped(SkipReason::ResumedPast),
+        ));
+        clean_crash_raw.push_str(&bench_line(
+            "baseline/counter",
+            BenchGroup::Baseline,
+            1,
+            BenchStatus::Pass,
+        ));
+        clean_crash_raw.push_str(&end_line(EndRecord {
+            benches_total: 2,
+            benches_passed: 1,
+            benches_skipped: 1,
+            ..EndRecord::default()
+        }));
+        let att1 = AttemptRecord {
+            attempt: 1,
+            resume_after: Some(String::from("baseline/loop")),
+            saw_end: true,
+            shutdown: ShutdownStatus::CleanExit,
+            protocol_errors: Vec::new(),
+            synthesized_failures: Vec::new(),
+        };
+        clean_crash_raw.push_str(&format!(
+            "# MBENCH_ATTEMPT {}\n",
+            serde_json::to_string(&att1).unwrap()
+        ));
+
+        let crash_rep = audit_capture("clean-crash-raw", &clean_crash_raw);
+        assert_eq!(crash_rep.format, CaptureFormat::RawSerial);
+        assert!(crash_rep.protocol_valid, "{:?}", crash_rep.protocol_errors);
+        assert!(crash_rep.completed);
+        assert!(crash_rep.recovered);
+        assert_eq!(crash_rep.attempts.len(), 2);
+        assert_eq!(crash_rep.attempts[0].shutdown, ShutdownStatus::Signaled);
+        assert_eq!(crash_rep.attempts[1].shutdown, ShutdownStatus::CleanExit);
+        assert_eq!(crash_rep.counts.benches_passed, 1);
+        assert_eq!(crash_rep.counts.benches_failed, 1);
+        assert_eq!(crash_rep.counts.benches_skipped, 0);
+        let loop_res = crash_rep
+            .benches
+            .iter()
+            .find(|b| b.id == "baseline/loop")
+            .expect("baseline/loop retained");
+        assert_eq!(loop_res.status, BenchStatusTag::Fail);
+        assert_eq!(loop_res.fail_reason.as_deref(), Some("crash"));
+        assert!(loop_res.synthetic);
 
         // Two META frames inside the same attempt boundary still fail.
         let mut dup_meta_raw = String::from("# MBENCH_RAW_ATTEMPT {\"attempt\":0}\n");

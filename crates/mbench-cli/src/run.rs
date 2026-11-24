@@ -1,6 +1,8 @@
 //! Target orchestration with fixed-seed shuffle, per-case watchdog timeout, and crash recovery.
 
 use std::{
+    collections::VecDeque,
+    ffi::OsString,
     fs,
     io::{self, LineWriter, Write},
     path::{Component, Path, PathBuf},
@@ -16,11 +18,12 @@ use clap::{Args, ValueEnum};
 use mbench_core::{
     config::{OrderMode, Profile, RunMode},
     protocol,
-    record::{BenchGroup, SbiExtensionId, SkipReason, StartKind},
+    record::{SbiExtensionId, SkipReason, StartKind},
     validate::{CaseTracker, audit_capture, audit_raw_attempt, summarize_records},
     wire::{
-        AttemptRecord, BenchFrame, BenchStatusTag, CheckFrame, CheckStatusTag, EnvLine,
-        RawAttemptStart, ShutdownStatus, StartFrame, WireFrame, parse_capture, parse_wire_line,
+        AttemptRecord, EnvLine, RawAttemptStart, ShutdownStatus, StartFrame, WireFrame,
+        parse_capture, parse_wire_line, shutdown_fail_reason, synthesize_fail_bench,
+        synthesize_fail_check,
     },
 };
 
@@ -194,6 +197,21 @@ pub(crate) fn execute(args: RunArgs) -> Result<(), String> {
     execute_with_runner(&runner, &args, &kernel_path)
 }
 
+fn resolve_label_and_out_path(args: &RunArgs) -> (String, PathBuf) {
+    let label = args.name.clone().unwrap_or_else(|| {
+        args.bios
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("firmware")
+            .to_string()
+    });
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("results").join(format!("{label}.jsonl")));
+    (label, out_path)
+}
+
 fn validate_run_args(args: &RunArgs) -> Result<(), String> {
     if !args.bios.exists() {
         return Err(format!("BIOS file does not exist: {}", args.bios.display()));
@@ -254,35 +272,123 @@ fn validate_run_args(args: &RunArgs) -> Result<(), String> {
     if let Some(raw_seed) = &args.seed {
         let _ = parse_seed_u64(raw_seed)?;
     }
-    if let Some(out_path) = &args.out {
-        validate_output_file_path("--out", out_path)?;
-    }
+    let (_, out_path) = resolve_label_and_out_path(args);
+    validate_output_file_path("--out", &out_path)?;
     if let Some(raw_log) = &args.raw_log {
         validate_output_file_path("--raw-log", raw_log)?;
-    }
-    if let (Some(out_path), Some(raw_log)) = (&args.out, &args.raw_log)
-        && paths_refer_to_same_file(out_path, raw_log)?
-    {
-        return Err(format!(
-            "--out ('{}') and --raw-log ('{}') must not refer to the same file",
-            out_path.display(),
-            raw_log.display()
-        ));
+        if paths_refer_to_same_file(&out_path, raw_log)? {
+            return Err(format!(
+                "--out ('{}') and --raw-log ('{}') must not refer to the same file",
+                out_path.display(),
+                raw_log.display()
+            ));
+        }
     }
     Ok(())
 }
 
+enum PathStep {
+    Prefix(OsString),
+    Root,
+    Cur,
+    Parent,
+    Normal(OsString),
+}
+
+fn push_components_front(queue: &mut VecDeque<PathStep>, path: &Path) {
+    let steps: Vec<PathStep> = path
+        .components()
+        .map(|comp| match comp {
+            Component::Prefix(p) => PathStep::Prefix(p.as_os_str().to_os_string()),
+            Component::RootDir => PathStep::Root,
+            Component::CurDir => PathStep::Cur,
+            Component::ParentDir => PathStep::Parent,
+            Component::Normal(s) => PathStep::Normal(s.to_os_string()),
+        })
+        .collect();
+    for step in steps.into_iter().rev() {
+        queue.push_front(step);
+    }
+}
+
+/// Resolves symlinks across existing prefixes and dangling/chained leaves before directory creation.
+fn resolve_logical_target_path(path: &Path) -> Result<PathBuf, String> {
+    const MAX_SYMLINK_HOPS: usize = 40;
+
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to resolve current directory: {e}"))?
+            .join(path)
+    };
+
+    let mut queue = VecDeque::new();
+    push_components_front(&mut queue, &abs);
+    let mut resolved = PathBuf::new();
+    let mut hops = 0usize;
+
+    while let Some(step) = queue.pop_front() {
+        match step {
+            PathStep::Prefix(p) => resolved.push(p),
+            PathStep::Root => resolved.push(std::path::MAIN_SEPARATOR_STR),
+            PathStep::Cur => {}
+            PathStep::Parent => {
+                let _ = resolved.pop();
+            }
+            PathStep::Normal(name) => {
+                let candidate = resolved.join(&name);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        hops += 1;
+                        if hops > MAX_SYMLINK_HOPS {
+                            return Err(format!(
+                                "too many levels of symbolic links while resolving '{}'",
+                                path.display()
+                            ));
+                        }
+                        let target = fs::read_link(&candidate).map_err(|e| {
+                            format!("failed to read symlink {}: {e}", candidate.display())
+                        })?;
+                        if target.is_absolute() {
+                            resolved.clear();
+                        }
+                        push_components_front(&mut queue, &target);
+                    }
+                    Ok(_) => resolved = candidate,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => resolved = candidate,
+                    Err(_) => resolved = candidate,
+                }
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
 fn validate_output_file_path(flag: &str, path: &Path) -> Result<(), String> {
-    if path.as_os_str().is_empty() || path.file_name().is_none() {
+    let raw = path.as_os_str().to_string_lossy();
+    if path.as_os_str().is_empty()
+        || raw.ends_with('/')
+        || raw.ends_with('\\')
+        || path.file_name().is_none()
+    {
         return Err(format!(
             "{flag} path '{}' must include a file name",
             path.display()
         ));
     }
-    if path.exists() && path.is_dir() {
+    let resolved = resolve_logical_target_path(path)?;
+    if resolved.file_name().is_none() {
+        return Err(format!(
+            "{flag} path '{}' must include a file name",
+            path.display()
+        ));
+    }
+    if resolved.exists() && resolved.is_dir() {
         return Err(format!("{flag} path '{}' is a directory", path.display()));
     }
-    if let Some(parent) = path.parent()
+    if let Some(parent) = resolved.parent()
         && !parent.as_os_str().is_empty()
     {
         for ancestor in parent.ancestors() {
@@ -304,47 +410,26 @@ fn validate_output_file_path(flag: &str, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_comparable_path(path: &Path) -> Result<PathBuf, String> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| format!("failed to resolve current directory: {e}"))?
-            .join(path)
-    };
-    if let Ok(canonical) = fs::canonicalize(&abs) {
-        return Ok(canonical);
-    }
-    if let (Some(parent), Some(file_name)) = (abs.parent(), abs.file_name())
-        && parent.exists()
-    {
-        let canonical_parent = fs::canonicalize(parent)
-            .map_err(|e| format!("failed to canonicalize {}: {e}", parent.display()))?;
-        return Ok(canonical_parent.join(file_name));
-    }
-    let mut cleaned = PathBuf::new();
-    for comp in abs.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = cleaned.pop();
-            }
-            other => cleaned.push(other.as_os_str()),
-        }
-    }
-    Ok(cleaned)
-}
-
 fn paths_refer_to_same_file(a: &Path, b: &Path) -> Result<bool, String> {
-    if resolve_comparable_path(a)? == resolve_comparable_path(b)? {
+    let res_a = resolve_logical_target_path(a)?;
+    let res_b = resolve_logical_target_path(b)?;
+    if res_a == res_b {
         return Ok(true);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if let (Ok(meta_a), Ok(meta_b)) = (fs::metadata(a), fs::metadata(b))
+        if let (Ok(meta_a), Ok(meta_b)) = (fs::metadata(&res_a), fs::metadata(&res_b))
             && meta_a.dev() == meta_b.dev()
             && meta_a.ino() == meta_b.ino()
+        {
+            return Ok(true);
+        }
+        if let (Some(parent_a), Some(parent_b)) = (res_a.parent(), res_b.parent())
+            && res_a.file_name() == res_b.file_name()
+            && let (Ok(meta_pa), Ok(meta_pb)) = (fs::metadata(parent_a), fs::metadata(parent_b))
+            && meta_pa.dev() == meta_pb.dev()
+            && meta_pa.ino() == meta_pb.ino()
         {
             return Ok(true);
         }
@@ -397,6 +482,23 @@ impl RawLogWriter {
         })
     }
 
+    #[cfg(unix)]
+    fn same_file_as(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(raw_meta), Ok(other_meta)) =
+            (self.writer.get_ref().metadata(), fs::metadata(path))
+        {
+            raw_meta.dev() == other_meta.dev() && raw_meta.ino() == other_meta.ino()
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn same_file_as(&self, _path: &Path) -> bool {
+        false
+    }
+
     fn write_attempt_header(
         &mut self,
         attempt: usize,
@@ -413,6 +515,23 @@ impl RawLogWriter {
         };
         if let Err(err) =
             writeln!(self.writer, "# MBENCH_RAW_ATTEMPT {json}").and_then(|()| self.writer.flush())
+            && !self.had_write_error
+        {
+            self.had_write_error = true;
+            return Some(format!(
+                "failed to write raw log {}: {err}",
+                self.path.display()
+            ));
+        }
+        None
+    }
+
+    fn write_attempt_footer(&mut self, record: &AttemptRecord) -> Option<String> {
+        let Ok(json) = serde_json::to_string(record) else {
+            return Some(String::from("failed to serialize # MBENCH_ATTEMPT footer"));
+        };
+        if let Err(err) =
+            writeln!(self.writer, "# MBENCH_ATTEMPT {json}").and_then(|()| self.writer.flush())
             && !self.had_write_error
         {
             self.had_write_error = true;
@@ -451,6 +570,59 @@ impl RawLogWriter {
     }
 }
 
+fn prepare_outputs(
+    out_path: &Path,
+    raw_log: Option<&Path>,
+) -> Result<Option<RawLogWriter>, String> {
+    validate_output_file_path("--out", out_path)?;
+    if let Some(raw) = raw_log {
+        validate_output_file_path("--raw-log", raw)?;
+        if paths_refer_to_same_file(out_path, raw)? {
+            return Err(format!(
+                "--out ('{}') and --raw-log ('{}') must not refer to the same file",
+                out_path.display(),
+                raw.display()
+            ));
+        }
+    }
+
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+
+    let Some(raw) = raw_log else {
+        return Ok(None);
+    };
+
+    if let Some(parent) = raw.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+
+    if paths_refer_to_same_file(out_path, raw)? {
+        return Err(format!(
+            "--out ('{}') and --raw-log ('{}') must not refer to the same file",
+            out_path.display(),
+            raw.display()
+        ));
+    }
+
+    let writer = RawLogWriter::create(raw)?;
+    if paths_refer_to_same_file(out_path, &writer.path)? || writer.same_file_as(out_path) {
+        return Err(format!(
+            "--out ('{}') and --raw-log ('{}') must not refer to the same file",
+            out_path.display(),
+            writer.path.display()
+        ));
+    }
+    Ok(Some(writer))
+}
+
 pub(crate) fn execute_with_runner<R: TargetRunner>(
     runner: &R,
     args: &RunArgs,
@@ -459,39 +631,8 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
     INTERRUPTED.store(false, Ordering::SeqCst);
     ensure_signal_handler()?;
 
-    let label = args.name.clone().unwrap_or_else(|| {
-        args.bios
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("firmware")
-            .to_string()
-    });
-    let out_path = args
-        .out
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("results").join(format!("{label}.jsonl")));
-    validate_output_file_path("--out", &out_path)?;
-    if let Some(raw_log) = &args.raw_log {
-        validate_output_file_path("--raw-log", raw_log)?;
-        if paths_refer_to_same_file(&out_path, raw_log)? {
-            return Err(format!(
-                "--out ('{}') and --raw-log ('{}') must not refer to the same file",
-                out_path.display(),
-                raw_log.display()
-            ));
-        }
-    }
-    if let Some(parent) = out_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-
-    let mut raw_writer = match &args.raw_log {
-        Some(path) => Some(RawLogWriter::create(path)?),
-        None => None,
-    };
+    let (label, out_path) = resolve_label_and_out_path(args);
+    let mut raw_writer = prepare_outputs(&out_path, args.raw_log.as_deref())?;
 
     let effective_seed = resolve_effective_seed(args)?;
 
@@ -525,6 +666,7 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
     let mut io_errors: Vec<String> = Vec::new();
     let mut resume_after: Option<String> = None;
     let mut completed_loop = false;
+    let mut was_interrupted = false;
 
     for attempt in 0..=MAX_RECOVERY_ATTEMPTS {
         if is_interrupted() {
@@ -538,12 +680,6 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
         }
 
         let current_resume = resume_after.clone();
-        if let Some(writer) = raw_writer.as_mut()
-            && let Some(err) = writer.write_attempt_header(attempt, current_resume.as_deref())
-        {
-            io_errors.push(err);
-        }
-
         let bootargs = build_bootargs(args, effective_seed, current_resume.as_deref());
         let launch_cfg = TargetLaunchConfig {
             bios: &args.bios,
@@ -556,6 +692,8 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
         let outcome = match run_single_attempt(
             runner,
             &launch_cfg,
+            attempt,
+            current_resume.as_deref(),
             Duration::from_secs(args.timeout.max(1)),
             &mut state,
             raw_writer.as_mut(),
@@ -575,7 +713,29 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
 
         let protocol_errors = audit_raw_attempt(&outcome.raw_lines, outcome.saw_end);
 
-        if outcome.interrupted && !outcome.saw_end {
+        if outcome.saw_end {
+            let synthesized = append_unclosed_end_failures(&outcome.unclosed_at_end, &mut state)?;
+            record_attempt(
+                &mut state,
+                raw_writer.as_mut(),
+                &mut io_errors,
+                AttemptRecord {
+                    attempt,
+                    resume_after: current_resume,
+                    saw_end: true,
+                    shutdown: outcome.shutdown.clone(),
+                    protocol_errors,
+                    synthesized_failures: synthesized,
+                },
+            )?;
+            if outcome.interrupted {
+                was_interrupted = true;
+            }
+            completed_loop = true;
+            break;
+        }
+
+        if outcome.interrupted {
             let mut synth_ids = Vec::with_capacity(outcome.stuck_cases.len());
             for stuck in &outcome.stuck_cases {
                 state
@@ -583,8 +743,10 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
                     .push(synthesize_fail_frame(stuck, "interrupted")?);
                 synth_ids.push(stuck.id.clone());
             }
-            push_attempt_record(
+            record_attempt(
                 &mut state,
+                raw_writer.as_mut(),
+                &mut io_errors,
                 AttemptRecord {
                     attempt,
                     resume_after: current_resume,
@@ -603,28 +765,8 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
             return Err(format_interrupted_error(&out_path, &io_errors));
         }
 
-        if outcome.saw_end {
-            let synthesized = append_unclosed_end_failures(&outcome.unclosed_at_end, &mut state)?;
-            push_attempt_record(
-                &mut state,
-                AttemptRecord {
-                    attempt,
-                    resume_after: current_resume,
-                    saw_end: true,
-                    shutdown: outcome.shutdown.clone(),
-                    protocol_errors,
-                    synthesized_failures: synthesized,
-                },
-            )?;
-            completed_loop = true;
-            break;
-        }
-
         let (next_resume, synthesized) = if !outcome.stuck_cases.is_empty() {
-            let reason = match outcome.shutdown {
-                ShutdownStatus::TimedOutDuringRun => "timeout",
-                _ => "crash",
-            };
+            let reason = shutdown_fail_reason(&outcome.shutdown);
             let resume_id = outcome
                 .stuck_cases
                 .last()
@@ -654,8 +796,10 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
             (None, Vec::new())
         };
 
-        push_attempt_record(
+        record_attempt(
             &mut state,
+            raw_writer.as_mut(),
+            &mut io_errors,
             AttemptRecord {
                 attempt,
                 resume_after: current_resume.clone(),
@@ -748,6 +892,19 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
     }
     errors.extend(io_errors);
 
+    if was_interrupted || is_interrupted() {
+        let base = format!(
+            "interrupted by signal after @@MBENCH:END; saved completed capture to {}",
+            out_path.display()
+        );
+        let msg = if errors.is_empty() {
+            base
+        } else {
+            format!("{base}\nadditional errors:\n  - {}", errors.join("\n  - "))
+        };
+        return Err(msg);
+    }
+
     if let Some(last) = report.attempts.last()
         && !matches!(
             last.shutdown,
@@ -800,18 +957,33 @@ fn save_outputs_independently(
 ) -> Vec<String> {
     let mut errors = Vec::new();
     if let Some(content) = out_content {
-        let write_res = (|| -> Result<(), String> {
-            if let Some(parent) = out_path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-            }
-            fs::write(out_path, content)
-                .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
-            eprintln!("[mbench-cli] saved {}", out_path.display());
-            Ok(())
-        })();
+        let alias_err = raw_writer.as_ref().and_then(|writer| {
+            let aliased = writer.same_file_as(out_path)
+                || matches!(paths_refer_to_same_file(out_path, &writer.path), Ok(true));
+            aliased.then(|| {
+                format!(
+                    "refusing to overwrite raw log '{}' through aliased --out path '{}'",
+                    writer.path.display(),
+                    out_path.display()
+                )
+            })
+        });
+        let write_res = if let Some(err) = alias_err {
+            Err(err)
+        } else {
+            (|| -> Result<(), String> {
+                if let Some(parent) = out_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+                }
+                fs::write(out_path, content)
+                    .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+                eprintln!("[mbench-cli] saved {}", out_path.display());
+                Ok(())
+            })()
+        };
         if let Err(err) = write_res {
             eprintln!("[mbench-cli] warning: {err}");
             errors.push(err);
@@ -828,9 +1000,19 @@ fn save_outputs_independently(
     errors
 }
 
-fn push_attempt_record(state: &mut CaptureState, record: AttemptRecord) -> Result<(), String> {
+fn record_attempt(
+    state: &mut CaptureState,
+    raw_writer: Option<&mut RawLogWriter>,
+    io_errors: &mut Vec<String>,
+    record: AttemptRecord,
+) -> Result<(), String> {
     let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
     state.frames.push(format!("# MBENCH_ATTEMPT {json}"));
+    if let Some(writer) = raw_writer
+        && let Some(err) = writer.write_attempt_footer(&record)
+    {
+        io_errors.push(err);
+    }
     Ok(())
 }
 
@@ -989,7 +1171,7 @@ impl AttemptTracker {
         interrupted: bool,
         exit_status: SessionExit,
     ) -> ShutdownStatus {
-        if interrupted && !self.saw_end {
+        if interrupted {
             return ShutdownStatus::Interrupted;
         }
         if self.saw_panic && !self.saw_end {
@@ -1069,15 +1251,23 @@ fn record_and_handle_line(
     tracker.process_line(&line, state)
 }
 
+#[expect(clippy::too_many_arguments)]
 fn run_single_attempt<R: TargetRunner>(
     runner: &R,
     cfg: &TargetLaunchConfig<'_>,
+    attempt: usize,
+    resume_after: Option<&str>,
     timeout: Duration,
     state: &mut CaptureState,
     mut raw_writer: Option<&mut RawLogWriter>,
     io_errors: &mut Vec<String>,
 ) -> Result<AttemptOutcome, String> {
     let mut session = runner.launch(cfg)?;
+    if let Some(writer) = raw_writer.as_deref_mut()
+        && let Some(err) = writer.write_attempt_header(attempt, resume_after)
+    {
+        io_errors.push(err);
+    }
     let mut phase_deadline = Instant::now() + timeout;
     let mut case_deadline: Option<Instant> = None;
     let mut tracker = AttemptTracker::new();
@@ -1160,19 +1350,31 @@ fn run_single_attempt<R: TargetRunner>(
         } else {
             timeout.min(POST_END_SHUTDOWN_TIMEOUT)
         };
-        match session.wait_for_exit(exit_grace) {
-            Ok(Some(exit)) => exit,
-            Ok(None) => {
-                if is_interrupted() {
-                    interrupted = true;
-                } else {
-                    timed_out = true;
-                }
-                session.terminate_and_wait()
+        let exit_deadline = Instant::now() + exit_grace;
+        loop {
+            if is_interrupted() {
+                interrupted = true;
+                break session.terminate_and_wait();
             }
-            Err(err) => {
-                let _ = session.terminate_and_wait();
-                return Err(err);
+            let slice = exit_deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100));
+            match session.wait_for_exit(slice) {
+                Ok(Some(exit)) => break exit,
+                Ok(None) => {
+                    if Instant::now() >= exit_deadline {
+                        if is_interrupted() {
+                            interrupted = true;
+                        } else {
+                            timed_out = true;
+                        }
+                        break session.terminate_and_wait();
+                    }
+                }
+                Err(err) => {
+                    let _ = session.terminate_and_wait();
+                    return Err(err);
+                }
             }
         }
     };
@@ -1205,72 +1407,15 @@ fn push_normalized_wire_line(raw_line: &str, out: &mut Vec<String>) {
 fn synthesize_fail_frame(started: &StartFrame, reason: &str) -> Result<String, String> {
     match started.kind {
         StartKind::Check => {
-            let frame = CheckFrame {
-                id: started.id.clone(),
-                checks: 0,
-                checks_total: 1,
-                checks_failed: 1,
-                status: CheckStatusTag::Fail,
-                skip_reason: None,
-                fail_reason: Some(reason.to_string()),
-                quirks: 0,
-                issues: Vec::new(),
-                note: None,
-                synthetic: true,
-            };
+            let frame = synthesize_fail_check(&started.id, reason);
             let json = serde_json::to_string(&frame).map_err(|e| e.to_string())?;
             Ok(format!("@@MBENCH:CHECK {json}"))
         }
         StartKind::Bench => {
-            let frame = BenchFrame {
-                id: started.id.clone(),
-                group: infer_bench_group(&started.id),
-                mode: None,
-                parallel: started.parallel,
-                unit: String::from("op"),
-                iters_per_trial: 0,
-                trials: 0,
-                status: BenchStatusTag::Fail,
-                skip_reason: None,
-                fail_reason: Some(reason.to_string()),
-                cycles: None,
-                instret: None,
-                ticks: None,
-                ns: None,
-                throughput_ops_per_sec: None,
-                note: None,
-                synthetic: true,
-                cal_index: None,
-            };
+            let frame = synthesize_fail_bench(&started.id, started.parallel, reason);
             let json = serde_json::to_string(&frame).map_err(|e| e.to_string())?;
             Ok(format!("@@MBENCH:BENCH {json}"))
         }
-    }
-}
-
-fn infer_bench_group(id: &str) -> BenchGroup {
-    let prefix = id.split_once('/').map_or(id, |(head, _)| head);
-    match prefix {
-        "baseline" => BenchGroup::Baseline,
-        "trap" => BenchGroup::TrapEmul,
-        "base" => BenchGroup::Base,
-        "time" => BenchGroup::Time,
-        "spi" => BenchGroup::Spi,
-        "rfnc" => BenchGroup::Rfnc,
-        "hsm" => BenchGroup::Hsm,
-        "srst" => BenchGroup::Srst,
-        "pmu" => BenchGroup::Pmu,
-        "dbcn" => BenchGroup::Dbcn,
-        "susp" => BenchGroup::Susp,
-        "cppc" => BenchGroup::Cppc,
-        "nacl" => BenchGroup::Nacl,
-        "sta" => BenchGroup::Sta,
-        "sse" => BenchGroup::Sse,
-        "fwft" => BenchGroup::Fwft,
-        "dbtr" => BenchGroup::Dbtr,
-        "mpxy" => BenchGroup::Mpxy,
-        "scale" => BenchGroup::Scale,
-        _ => BenchGroup::Baseline,
     }
 }
 
@@ -1356,7 +1501,10 @@ fn convert_elf_to_binary(elf: &Path, bin: &Path) -> Result<(), String> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use mbench_core::{config::ClockRegime, protocol::write_cal_line, record::CalibrationRecord};
+    use mbench_core::{
+        config::ClockRegime, protocol::write_cal_line, record::CalibrationRecord,
+        wire::CheckStatusTag,
+    };
 
     use super::*;
 
@@ -1581,6 +1729,113 @@ mod tests {
         hardlinked.raw_log = Some(link_b.clone());
         let err = validate_run_args(&hardlinked).unwrap_err();
         assert!(err.contains("same file"), "{err}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            // Dangling symlink pointing out -> nonexistent raw log must be rejected before creating raw log.
+            let raw_target = dir.0.join("dangling-raw.log");
+            let out_symlink = dir.0.join("dangling-out.jsonl");
+            symlink(&raw_target, &out_symlink).unwrap();
+            let mut dangling_args = base_args();
+            dangling_args.out = Some(out_symlink.clone());
+            dangling_args.raw_log = Some(raw_target.clone());
+            let err = validate_run_args(&dangling_args).unwrap_err();
+            assert!(err.contains("same file"), "{err}");
+            let prep_err = match prepare_outputs(&out_symlink, Some(&raw_target)) {
+                Ok(_) => panic!("expected prepare_outputs to reject dangling symlink alias"),
+                Err(e) => e,
+            };
+            assert!(prep_err.contains("same file"), "{prep_err}");
+            assert!(!raw_target.exists());
+
+            // Reverse dangling symlink raw -> nonexistent out must also be rejected.
+            let out_target = dir.0.join("dangling-target.jsonl");
+            let raw_symlink = dir.0.join("dangling-raw-link.log");
+            symlink(&out_target, &raw_symlink).unwrap();
+            let mut rev_args = base_args();
+            rev_args.out = Some(out_target.clone());
+            rev_args.raw_log = Some(raw_symlink.clone());
+            let err = validate_run_args(&rev_args).unwrap_err();
+            assert!(err.contains("same file"), "{err}");
+
+            // Chained dangling symlinks and cyclic symlink loops must be handled cleanly.
+            let hop1 = dir.0.join("hop1.jsonl");
+            let hop2 = dir.0.join("hop2.jsonl");
+            symlink(&hop2, &hop1).unwrap();
+            symlink(&raw_target, &hop2).unwrap();
+            assert!(paths_refer_to_same_file(&hop1, &raw_target).unwrap());
+
+            let loop_a = dir.0.join("loop-a");
+            let loop_b = dir.0.join("loop-b");
+            symlink(&loop_b, &loop_a).unwrap();
+            symlink(&loop_a, &loop_b).unwrap();
+            let loop_err = validate_output_file_path("--out", &loop_a).unwrap_err();
+            assert!(loop_err.contains("symbolic links"), "{loop_err}");
+
+            // Aliased directory symlink above uncreated subdirectories must be rejected before mkdir.
+            let real_dir = dir.0.join("real-dir");
+            fs::create_dir_all(&real_dir).unwrap();
+            let alias_dir = dir.0.join("alias-dir");
+            symlink(&real_dir, &alias_dir).unwrap();
+            let aliased_out = alias_dir.join("sub1/sub2/shared.out");
+            let aliased_raw = real_dir.join("sub1/sub2/shared.out");
+            let mut sub_args = base_args();
+            sub_args.out = Some(aliased_out.clone());
+            sub_args.raw_log = Some(aliased_raw.clone());
+            let err = validate_run_args(&sub_args).unwrap_err();
+            assert!(err.contains("same file"), "{err}");
+            let prep_err = match prepare_outputs(&aliased_out, Some(&aliased_raw)) {
+                Ok(_) => panic!("expected prepare_outputs to reject aliased dir subpaths"),
+                Err(e) => e,
+            };
+            assert!(prep_err.contains("same file"), "{prep_err}");
+            assert!(!real_dir.join("sub1").exists());
+
+            // Distinct filenames under aliased directories remain allowed.
+            let distinct_raw = alias_dir.join("sub1/sub2/raw.log");
+            assert!(prepare_outputs(&aliased_out, Some(&distinct_raw)).is_ok());
+
+            // Mid-run symlink swap before final save must refuse to overwrite raw_log.
+            let swap_raw = dir.0.join("swap-raw.log");
+            let swap_out = dir.0.join("swap-out.jsonl");
+            let mut swap_writer = Some(RawLogWriter::create(&swap_raw).unwrap());
+            assert!(
+                swap_writer
+                    .as_mut()
+                    .unwrap()
+                    .write_line("untouched raw serial")
+                    .is_none()
+            );
+            symlink(&swap_raw, &swap_out).unwrap();
+            let errs = save_outputs_independently(&swap_out, Some("overwritten"), &mut swap_writer);
+            assert_eq!(errs.len(), 1);
+            assert!(errs[0].contains("refusing to overwrite"), "{errs:?}");
+            assert_eq!(
+                fs::read_to_string(&swap_raw).unwrap(),
+                "untouched raw serial\n"
+            );
+        }
+
+        // Interruption after END must classify as ShutdownStatus::Interrupted, never TimedOutAfterEnd.
+        let mut tracker = AttemptTracker::new();
+        let mut cap_state = CaptureState {
+            frames: Vec::new(),
+            quarantine_warnings: 0,
+        };
+        let _ = tracker.process_line(
+            "@@MBENCH:END {\"checks_total\":0,\"checks_passed\":0,\"checks_skipped\":0,\"checks_failed\":0,\"check_assertions_total\":0,\"check_assertions_passed\":0,\"check_assertions_failed\":0,\"benches_total\":0,\"benches_passed\":0,\"benches_skipped\":0,\"benches_hw_native\":0,\"benches_delegated\":0,\"benches_failed\":0,\"quarantine_warnings\":0}",
+            &mut cap_state,
+        );
+        assert_eq!(
+            tracker.classify_shutdown(false, true, SessionExit::Killed),
+            ShutdownStatus::Interrupted
+        );
+        assert_eq!(
+            tracker.classify_shutdown(true, true, SessionExit::Killed),
+            ShutdownStatus::Interrupted
+        );
 
         // Failing to write one output must not skip flushing/saving the other output.
         let raw_ok = dir.0.join("independent.log");
