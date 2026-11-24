@@ -1,4 +1,4 @@
-//! Domain records, SBI v3.0 capability masks, and shared run-state gating.
+//! Firmware capabilities, result records, and shared run-state gating.
 
 use bitflags::bitflags;
 #[cfg(feature = "std")]
@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{Profile, RunConfig, effective_max_harts},
     stats::{CounterStats, DerivedNsStats},
+};
+
+mod case;
+pub use case::{
+    BenchGroup, BenchStatus, CaseFlags, CaseGate, CheckIssue, CheckIssues, CheckStatus, FailReason,
+    IssueClass, MAX_CHECK_ISSUES, MeasureMode, SkipReason, StartKind,
 };
 
 /// Minimal hart-count topology interface sufficient for functional conformance gating.
@@ -21,21 +27,37 @@ pub trait HartTopology {
 #[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
 #[repr(u8)]
 pub enum SbiExtensionId {
+    /// Base discovery extension.
     Base = 0,
+    /// Timer extension.
     Time = 1,
+    /// Interprocessor interrupt extension.
     Spi = 2,
+    /// Remote fence extension.
     Rfnc = 3,
+    /// Hart state management extension.
     Hsm = 4,
+    /// System reset extension.
     Srst = 5,
+    /// Performance monitoring extension.
     Pmu = 6,
+    /// Debug console extension.
     Dbcn = 7,
+    /// System suspend extension.
     Susp = 8,
+    /// Collaborative processor performance control extension.
     Cppc = 9,
+    /// Nested acceleration extension.
     Nacl = 10,
+    /// Steal-time accounting extension.
     Sta = 11,
+    /// Supervisor software events extension.
     Sse = 12,
+    /// Firmware feature configuration extension.
     Fwft = 13,
+    /// Debug triggers extension.
     Dbtr = 14,
+    /// Message proxy extension.
     Mpxy = 15,
 }
 
@@ -111,7 +133,7 @@ impl SbiExtensionId {
 }
 
 bitflags! {
-    /// Probed SBI v3.0 extension availability bitmap.
+    /// Availability bitmap corresponding to [`SbiExtensionId`].
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct SbiCapMask: u32 {
         const BASE = 1 << 0;
@@ -174,11 +196,15 @@ pub struct MetaRecord<'a> {
     pub extensions: SbiCapMask,
     pub hart_count: usize,
     pub boot_hart_id: usize,
+    /// Platform timer frequency in ticks per second.
     pub timebase_hz: u64,
+    /// Counter accessibility and timing characteristics probed at boot.
     pub counters: CounterAvailability,
     pub has_sstc: bool,
     pub has_h_ext: bool,
+    /// Timer value sampled during startup.
     pub boot_ticks: u64,
+    /// Size in bytes of firmware-reserved memory discovered at boot.
     pub reserved_mem_bytes: u64,
     pub console_backend: &'a str,
     pub pmu_counter_count: usize,
@@ -190,382 +216,39 @@ pub struct MetaRecord<'a> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CalibrationRecord {
     pub profile: Profile,
+    /// Number of outer measurement trials.
     pub trials: usize,
+    /// Calibrated empty-loop iteration count meeting the target measurement window.
     pub enough_iters: u64,
+    /// Empty-loop overhead per iteration in cycles multiplied by 100.
     pub loop_overhead_cycles_x100: u64,
+    /// Empty-loop overhead per iteration in retired instructions multiplied by 100.
     pub loop_overhead_instret_x100: u64,
+    /// Empty-loop overhead per iteration in timer ticks multiplied by 100.
     pub loop_overhead_ticks_x100: u64,
+    /// Counter sampling overhead per measurement window in cycles multiplied by 100.
     pub timer_overhead_cycles_x100: u64,
+    /// Counter sampling overhead per measurement window in retired instructions multiplied by 100.
     pub timer_overhead_instret_x100: u64,
+    /// Counter sampling overhead per measurement window in timer ticks multiplied by 100.
     pub timer_overhead_ticks_x100: u64,
+    /// Estimated cost of one time-counter read in cycles multiplied by 100.
     pub rdtime_read_cycles_x100: u64,
     pub is_rdtime_emulated: bool,
 }
-
-/// Kind of case announced in an `@@MBENCH:START` frame.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "std", derive(Deserialize, Serialize))]
-#[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
-pub enum StartKind {
-    Check,
-    Bench,
-}
-
-impl StartKind {
-    /// Returns the lowercase wire tag of this case kind.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Check => "check",
-            Self::Bench => "bench",
-        }
-    }
-}
-
-/// Logical suite group for a performance benchmark case.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "std", derive(Deserialize, Serialize))]
-#[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
-pub enum BenchGroup {
-    Baseline,
-    TrapEmul,
-    Base,
-    Time,
-    Spi,
-    Rfnc,
-    Hsm,
-    Srst,
-    Pmu,
-    Dbcn,
-    Susp,
-    Cppc,
-    Nacl,
-    Sta,
-    Sse,
-    Fwft,
-    Dbtr,
-    Mpxy,
-    Scale,
-}
-
-impl BenchGroup {
-    /// Returns the lowercase wire name of this group.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Baseline => "baseline",
-            Self::TrapEmul => "trap_emul",
-            Self::Base => "base",
-            Self::Time => "time",
-            Self::Spi => "spi",
-            Self::Rfnc => "rfnc",
-            Self::Hsm => "hsm",
-            Self::Srst => "srst",
-            Self::Pmu => "pmu",
-            Self::Dbcn => "dbcn",
-            Self::Susp => "susp",
-            Self::Cppc => "cppc",
-            Self::Nacl => "nacl",
-            Self::Sta => "sta",
-            Self::Sse => "sse",
-            Self::Fwft => "fwft",
-            Self::Dbtr => "dbtr",
-            Self::Mpxy => "mpxy",
-            Self::Scale => "scale",
-        }
-    }
-}
-
-/// Measurement primitive actually executed to produce a performance benchmark result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "std", derive(Deserialize, Serialize))]
-#[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
-pub enum MeasureMode {
-    Batched,
-    #[cfg_attr(feature = "std", serde(rename = "batched_preamble"))]
-    BatchedWithPreamble,
-    PairedEvent,
-    ParallelSweep,
-}
-
-impl MeasureMode {
-    /// Returns the lowercase wire name of this mode.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Batched => "batched",
-            Self::BatchedWithPreamble => "batched_preamble",
-            Self::PairedEvent => "paired_event",
-            Self::ParallelSweep => "parallel_sweep",
-        }
-    }
-}
-
-/// Structured reason why a check or benchmark case was skipped.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "std", derive(Deserialize, Serialize))]
-#[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
-pub enum SkipReason {
-    ExtensionUnsupported,
-    FunctionUnsupported,
-    SingleHartOnly,
-    RequiresIoFlag,
-    RequiresDestructiveFlag,
-    FeatureLocked,
-    CounterUnavailable,
-    NoUsableResource,
-    WakeSourceUnavailable,
-    ResumedPast,
-    FilteredOut,
-    ShmemTooLarge,
-}
-
-impl SkipReason {
-    /// Returns a stable machine-readable reason code.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ExtensionUnsupported => "extension_unsupported",
-            Self::FunctionUnsupported => "function_unsupported",
-            Self::SingleHartOnly => "single_hart_only",
-            Self::RequiresIoFlag => "requires_io_flag",
-            Self::RequiresDestructiveFlag => "requires_destructive_flag",
-            Self::FeatureLocked => "feature_locked",
-            Self::CounterUnavailable => "counter_unavailable",
-            Self::NoUsableResource => "no_usable_resource",
-            Self::WakeSourceUnavailable => "wake_source_unavailable",
-            Self::ResumedPast => "resumed_past",
-            Self::FilteredOut => "filtered_out",
-            Self::ShmemTooLarge => "shmem_too_large",
-        }
-    }
-}
-
-bitflags! {
-    /// Capability and safety flags attached to a conformance check or benchmark case.
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-    pub struct CaseFlags: u32 {
-        /// Case performs visible serial/console I/O and requires `io=1`.
-        const IO_BOUND = 1 << 0;
-        /// Case triggers destructive or suspend platform state and requires `destructive=1`.
-        const DESTRUCTIVE = 1 << 1;
-    }
-}
-
-/// Shared execution gating criteria used by both conformance checks and benchmarks.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CaseGate {
-    pub required_ext: Option<SbiExtensionId>,
-    pub min_harts: usize,
-    pub flags: CaseFlags,
-}
-
-impl CaseGate {
-    /// Creates a gate requiring `required_ext`, `min_harts`, and `flags`.
-    pub const fn new(
-        required_ext: Option<SbiExtensionId>,
-        min_harts: usize,
-        flags: CaseFlags,
-    ) -> Self {
-        Self {
-            required_ext,
-            min_harts,
-            flags,
-        }
-    }
-}
-
-/// Maximum number of per-case issues/observations retained in fixed-capacity zero-heap storage.
-pub const MAX_CHECK_ISSUES: usize = 8;
-
-/// Classification distinguishing normative SBI violations from permitted behaviors and quirks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IssueClass {
-    /// Mandatory SBI specification requirement violated; fails the check.
-    SpecViolation,
-    /// Mandatory SBI requirement violated due to a known firmware quirk; still fails the check.
-    SpecViolationWithQuirk(&'static str),
-    /// Behavior permitted by the SBI specification (e.g., optional `SBI_ERR_FAILED`); observation only.
-    PermittedBehavior,
-    /// Sub-check could not run because platform contract lacks an optional input; observation only.
-    Unsupported,
-}
-
-impl IssueClass {
-    /// Returns `true` when this issue represents a normative specification failure.
-    pub const fn is_failure(self) -> bool {
-        matches!(self, Self::SpecViolation | Self::SpecViolationWithQuirk(_))
-    }
-
-    /// Returns `true` when this issue annotates a known firmware quirk.
-    pub const fn quirk(self) -> Option<&'static str> {
-        match self {
-            Self::SpecViolationWithQuirk(q) => Some(q),
-            Self::SpecViolation | Self::PermittedBehavior | Self::Unsupported => None,
-        }
-    }
-
-    /// Returns the lowercase wire tag of this issue class.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::SpecViolation => "spec_violation",
-            Self::SpecViolationWithQuirk(_) => "spec_violation_with_quirk",
-            Self::PermittedBehavior => "permitted_behavior",
-            Self::Unsupported => "unsupported",
-        }
-    }
-}
-
-/// One structured assertion failure or non-fatal observation recorded inside a conformance case.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CheckIssue {
-    pub label: &'static str,
-    pub class: IssueClass,
-    pub reason: FailReason,
-}
-
-/// Fixed-capacity zero-heap collection of [`CheckIssue`] entries attached to a [`CheckResult`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CheckIssues {
-    entries: [Option<CheckIssue>; MAX_CHECK_ISSUES],
-    len: u8,
-    truncated: bool,
-}
-
-impl Default for CheckIssues {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CheckIssues {
-    /// Creates an empty fixed-capacity issue buffer.
-    pub const fn new() -> Self {
-        Self {
-            entries: [None; MAX_CHECK_ISSUES],
-            len: 0,
-            truncated: false,
-        }
-    }
-
-    /// Appends `issue`, prioritizing normative failures over informational observations if full.
-    pub fn push(&mut self, issue: CheckIssue) {
-        let idx = self.len as usize;
-        if idx < MAX_CHECK_ISSUES {
-            self.entries[idx] = Some(issue);
-            self.len += 1;
-            return;
-        }
-        if issue.class.is_failure()
-            && let Some(slot) = self
-                .entries
-                .iter_mut()
-                .find(|e| e.is_some_and(|existing| !existing.class.is_failure()))
-        {
-            *slot = Some(issue);
-        }
-        self.truncated = true;
-    }
-
-    /// Returns the number of stored entries.
-    pub const fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    /// Returns `true` when zero entries are stored.
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Returns `true` when more than [`MAX_CHECK_ISSUES`] issues occurred.
-    pub const fn is_truncated(&self) -> bool {
-        self.truncated
-    }
-
-    /// Iterates over stored entries in insertion order.
-    pub fn iter(&self) -> impl Iterator<Item = CheckIssue> + '_ {
-        self.entries[..self.len()].iter().flatten().copied()
-    }
-
-    /// Returns `true` if any stored entry represents a normative failure.
-    pub fn has_failure(&self) -> bool {
-        self.iter().any(|issue| issue.class.is_failure())
-    }
-
-    /// Returns the first stored normative failure, if any.
-    pub fn first_failure(&self) -> Option<CheckIssue> {
-        self.iter().find(|issue| issue.class.is_failure())
-    }
-
-    /// Counts stored entries annotated with a firmware quirk.
-    pub fn quirk_count(&self) -> u8 {
-        self.iter()
-            .filter(|issue| issue.class.quirk().is_some())
-            .count() as u8
-    }
-}
-
-/// Structured reason why a check or benchmark case failed verification or execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FailReason {
-    UnexpectedSbiError(isize),
-    UnexpectedTrap(usize),
-    VerificationMismatch,
-    Timeout,
-    SecondaryHartError(isize),
-    HardwareInconsistent,
-    AbiRegClobbered,
-    SecurityViolation(&'static str),
-    AssertionFailed(&'static str),
-}
-
-/// Final classification of a functional conformance check.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CheckStatus {
-    Pass,
-    Skipped(SkipReason),
-    Failed(FailReason),
-}
-
-impl CheckStatus {
-    /// Returns the uppercase status label emitted in wire and progress records.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Pass => "PASS",
-            Self::Skipped(_) => "SKIPPED",
-            Self::Failed(_) => "FAIL",
-        }
-    }
-}
-
-/// Final classification of an executed performance benchmark invocation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BenchStatus {
-    Pass,
-    Skipped(SkipReason),
-    HwNative,
-    DelegatedToS,
-    Failed(FailReason),
-}
-
-impl BenchStatus {
-    /// Returns the uppercase status label emitted in wire and progress records.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Pass => "PASS",
-            Self::Skipped(_) => "SKIPPED",
-            Self::HwNative => "HW_NATIVE",
-            Self::DelegatedToS => "DELEGATED_TO_S",
-            Self::Failed(_) => "FAIL",
-        }
-    }
-}
-
 /// Result record for one functional conformance check suite (`@@MBENCH:CHECK`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckResult<'a> {
     pub id: &'a str,
+    /// Number of passed assertions in this check.
     pub checks: u64,
+    /// Number of assertions evaluated in this check, including failures.
     pub checks_total: u64,
     pub checks_failed: u64,
     pub status: CheckStatus,
+    /// Retained assertion failures and observations.
     pub issues: CheckIssues,
+    /// Number of retained failures annotated with known firmware quirks.
     pub quirks: u8,
     pub note: Option<&'a str>,
 }
@@ -575,16 +258,22 @@ pub struct CheckResult<'a> {
 pub struct BenchResult<'a> {
     pub id: &'a str,
     pub group: BenchGroup,
+    /// Measurement primitive used, absent for unmeasured outcomes.
     pub mode: Option<MeasureMode>,
+    /// Number of participating harts for this result.
     pub parallel: usize,
     pub unit: &'a str,
+    /// Per-trial operation divisor or paired sample count reported by the measurement mode.
     pub iters_per_trial: u64,
+    /// Number of outer measurement trials.
     pub trials: usize,
     pub status: BenchStatus,
     pub cycles: Option<CounterStats>,
     pub instret: Option<CounterStats>,
     pub ticks: Option<CounterStats>,
+    /// Optional nanosecond statistics derived from the timer-tick samples.
     pub ns: Option<DerivedNsStats>,
+    /// Optional aggregate throughput in operations per second.
     pub throughput_ops_per_sec: Option<u64>,
     pub note: Option<&'a str>,
 }
@@ -592,7 +281,8 @@ pub struct BenchResult<'a> {
 /// Final summary record emitted after all requested checks and benchmarks complete.
 ///
 /// Note: `checks_total`, `checks_passed`, `checks_skipped`, and `checks_failed` count
-/// top-level [`CheckCase`] invocations, whereas `check_assertions_*` aggregate sub-assertions.
+/// top-level [`crate::check::CheckCase`] invocations, whereas `check_assertions_*` aggregate sub-assertions.
+/// Benchmark counts include each parallel sweep point.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "std", derive(Deserialize, Serialize))]
 pub struct EndRecord {
@@ -612,6 +302,7 @@ pub struct EndRecord {
     pub benches_hw_native: usize,
     pub benches_delegated: usize,
     pub benches_failed: usize,
+    /// Number of warnings reported by resource cleanup between cases.
     pub quarantine_warnings: usize,
 }
 
@@ -620,7 +311,9 @@ pub struct EndRecord {
 pub struct RunState<'a> {
     pub config: RunConfig<'a>,
     pub caps: SbiCapMask,
+    /// Most recent calibration, or none before calibration.
     pub cal: Option<CalibrationRecord>,
+    /// Whether the inclusive resume point has already been skipped.
     pub passed_resume_point: bool,
     pub summary: EndRecord,
 }

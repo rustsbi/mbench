@@ -6,12 +6,19 @@ bitflags! {
     /// Probed RISC-V ISA extensions relevant to S-mode benchmarking and conformance.
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct IsaExtensions: u32 {
+        /// Supervisor timer compare extension.
         const SSTC = 1 << 0;
+        /// Hypervisor extension.
         const H = 1 << 1;
+        /// Software-managed page-table accessed and dirty bits.
         const SVADE = 1 << 2;
+        /// Page-based memory types.
         const SVPBMT = 1 << 3;
+        /// Cache-block management operations.
         const ZICBOM = 1 << 4;
+        /// Base counters and timers.
         const ZICNTR = 1 << 5;
+        /// Hardware performance-monitoring counters.
         const ZIHPM = 1 << 6;
     }
 }
@@ -78,12 +85,7 @@ pub fn parse_isa_extensions_list(raw: &[u8]) -> IsaExtensions {
         if !name.is_ascii() {
             continue;
         }
-        let base_name = strip_trailing_version(name);
-        if base_name.len() == 1 {
-            if let Some(flag) = lookup_ext(SINGLE_LETTER_EXTS, base_name) {
-                extensions |= flag;
-            }
-        } else if let Some(flag) = lookup_ext(MULTI_LETTER_EXTS, base_name) {
+        if let Some(flag) = lookup_token(name) {
             extensions |= flag;
         }
     }
@@ -143,17 +145,22 @@ pub fn parse_isa_string(isa: &str) -> IsaExtensions {
         if part.is_empty() {
             continue;
         }
-        let base_name = strip_trailing_version(part);
-        if base_name.len() == 1 {
-            if let Some(flag) = lookup_ext(SINGLE_LETTER_EXTS, base_name) {
-                extensions |= flag;
-            }
-        } else if let Some(flag) = lookup_ext(MULTI_LETTER_EXTS, base_name) {
+        if let Some(flag) = lookup_token(part) {
             extensions |= flag;
         }
     }
 
     extensions
+}
+
+fn lookup_token(name: &str) -> Option<IsaExtensions> {
+    let base_name = strip_trailing_version(name);
+    let table = if base_name.len() == 1 {
+        SINGLE_LETTER_EXTS
+    } else {
+        MULTI_LETTER_EXTS
+    };
+    lookup_ext(table, base_name)
 }
 
 fn lookup_ext(table: &[ExtEntry], name: &str) -> Option<IsaExtensions> {

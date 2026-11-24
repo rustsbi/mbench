@@ -1,4 +1,6 @@
-//! Zero-allocation streaming `@@MBENCH:*` JSONL and progress writers.
+//! Zero-allocation streaming JSONL and progress writers.
+//!
+//! Writer errors may leave partial output; none of these functions roll it back.
 
 use core::fmt::{self, Write};
 
@@ -11,6 +13,10 @@ use crate::{
 };
 
 /// Writes an `@@MBENCH:META` JSONL frame to `out`.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_meta_line(meta: &MetaRecord<'_>, out: &mut (impl Write + ?Sized)) -> fmt::Result {
     write!(
         out,
@@ -89,6 +95,10 @@ pub fn write_meta_line(meta: &MetaRecord<'_>, out: &mut (impl Write + ?Sized)) -
 }
 
 /// Writes an `@@MBENCH:CAL` JSONL frame to `out`.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_cal_line(cal: &CalibrationRecord, out: &mut (impl Write + ?Sized)) -> fmt::Result {
     writeln!(
         out,
@@ -112,6 +122,10 @@ pub fn write_cal_line(cal: &CalibrationRecord, out: &mut (impl Write + ?Sized)) 
 }
 
 /// Writes an `@@MBENCH:START` JSONL frame before executing a check or benchmark case.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_start_line(
     kind: StartKind,
     id: &str,
@@ -128,6 +142,10 @@ pub fn write_start_line(
 }
 
 /// Writes an `@@MBENCH:CHECK` JSONL frame for one completed functional conformance check.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_check_line(res: &CheckResult<'_>, out: &mut (impl Write + ?Sized)) -> fmt::Result {
     out.write_str("@@MBENCH:CHECK {\"id\":")?;
     write_json_str(res.id, out)?;
@@ -178,6 +196,10 @@ pub fn write_check_line(res: &CheckResult<'_>, out: &mut (impl Write + ?Sized)) 
 }
 
 /// Writes an `@@MBENCH:BENCH` JSONL frame for one completed performance benchmark invocation.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_bench_line(res: &BenchResult<'_>, out: &mut (impl Write + ?Sized)) -> fmt::Result {
     out.write_str("@@MBENCH:BENCH {\"id\":")?;
     write_json_str(res.id, out)?;
@@ -221,6 +243,10 @@ pub fn write_bench_line(res: &BenchResult<'_>, out: &mut (impl Write + ?Sized)) 
 }
 
 /// Writes an `@@MBENCH:END` JSONL frame after all requested phases complete.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_end_line(end: &EndRecord, out: &mut (impl Write + ?Sized)) -> fmt::Result {
     writeln!(
         out,
@@ -247,6 +273,10 @@ pub fn write_end_line(end: &EndRecord, out: &mut (impl Write + ?Sized)) -> fmt::
 }
 
 /// Writes a properly JSON-escaped `@@MBENCH:PANIC` frame from any `Display` payload.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_panic_line(msg: impl fmt::Display, out: &mut (impl Write + ?Sized)) -> fmt::Result {
     out.write_str("\n@@MBENCH:PANIC {\"message\":\"")?;
     let mut esc = JsonEscapedWriter(out);
@@ -255,6 +285,10 @@ pub fn write_panic_line(msg: impl fmt::Display, out: &mut (impl Write + ?Sized))
 }
 
 /// Writes an `@@MBENCH:PANIC` frame describing an unhandled S-mode trap.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_unhandled_trap_panic(
     scause: usize,
     stval: usize,
@@ -268,6 +302,10 @@ pub fn write_unhandled_trap_panic(
 }
 
 /// Writes one human-readable progress line for a functional conformance check.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_check_progress(res: &CheckResult<'_>, out: &mut (impl Write + ?Sized)) -> fmt::Result {
     write!(out, "[mbench] {:<30} ", res.id)?;
     match res.status {
@@ -298,6 +336,10 @@ pub fn write_check_progress(res: &CheckResult<'_>, out: &mut (impl Write + ?Size
 }
 
 /// Writes one human-readable progress line summarizing a performance benchmark result.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_bench_progress(res: &BenchResult<'_>, out: &mut (impl Write + ?Sized)) -> fmt::Result {
     write!(out, "[mbench] {:<30} p={:<2} ", res.id, res.parallel)?;
     match res.status {
@@ -337,6 +379,10 @@ pub fn write_bench_progress(res: &BenchResult<'_>, out: &mut (impl Write + ?Size
 }
 
 /// Formats a fixed-point `STATS_SCALE` (100x) integer as `int.dec`.
+///
+/// # Errors
+///
+/// Propagates writer errors; output may be partial.
 pub fn write_scaled(scaled: u64, out: &mut (impl Write + ?Sized)) -> fmt::Result {
     let whole = scaled / STATS_SCALE;
     let frac = scaled % STATS_SCALE;
@@ -351,20 +397,23 @@ fn write_opt_counter_stats(
     let Some(s) = stats else {
         return Ok(());
     };
+    write!(out, ",\"{name}\":{{")?;
+    write_distribution_fields(
+        [
+            s.min_x100,
+            s.p25_x100,
+            s.median_x100,
+            s.p75_x100,
+            s.p95_x100,
+            s.max_x100,
+            s.iqr_x100,
+        ],
+        out,
+    )?;
     write!(
         out,
-        ",\"{name}\":{{\"min_x100\":{},\"p25_x100\":{},\"median_x100\":{},\"p75_x100\":{},\
-         \"p95_x100\":{},\"max_x100\":{},\"iqr_x100\":{},\"raw_batch_median\":{},\"is_noisy\":{},\
-         \"raw_batch_totals\":",
-        s.min_x100,
-        s.p25_x100,
-        s.median_x100,
-        s.p75_x100,
-        s.p95_x100,
-        s.max_x100,
-        s.iqr_x100,
-        s.raw_batch_median,
-        s.is_noisy,
+        ",\"raw_batch_median\":{},\"is_noisy\":{},\"raw_batch_totals\":",
+        s.raw_batch_median, s.is_noisy
     )?;
     write_u64_array(s.raw_batch_totals(), out)?;
     out.write_str(",\"net_samples_x100\":")?;
@@ -379,21 +428,31 @@ fn write_opt_ns_stats(
     let Some(s) = stats else {
         return Ok(());
     };
-    write!(
+    out.write_str(",\"ns\":{")?;
+    write_distribution_fields(
+        [
+            s.min_x100,
+            s.p25_x100,
+            s.median_x100,
+            s.p75_x100,
+            s.p95_x100,
+            s.max_x100,
+            s.iqr_x100,
+        ],
         out,
-        ",\"ns\":{{\"min_x100\":{},\"p25_x100\":{},\"median_x100\":{},\"p75_x100\":{},\
-         \"p95_x100\":{},\"max_x100\":{},\"iqr_x100\":{},\"is_noisy\":{},\"net_samples_x100\":",
-        s.min_x100,
-        s.p25_x100,
-        s.median_x100,
-        s.p75_x100,
-        s.p95_x100,
-        s.max_x100,
-        s.iqr_x100,
-        s.is_noisy,
     )?;
+    write!(out, ",\"is_noisy\":{},\"net_samples_x100\":", s.is_noisy)?;
     write_u64_array(s.net_samples_x100(), out)?;
     out.write_str("}")
+}
+
+fn write_distribution_fields(values: [u64; 7], out: &mut (impl Write + ?Sized)) -> fmt::Result {
+    let [min, p25, median, p75, p95, max, iqr] = values;
+    write!(
+        out,
+        "\"min_x100\":{min},\"p25_x100\":{p25},\"median_x100\":{median},\
+        \"p75_x100\":{p75},\"p95_x100\":{p95},\"max_x100\":{max},\"iqr_x100\":{iqr}"
+    )
 }
 
 fn write_u64_array(vals: &[u64], out: &mut (impl Write + ?Sized)) -> fmt::Result {
