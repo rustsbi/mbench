@@ -52,6 +52,10 @@ unsafe extern "C" fn mbench_ap_rust_entry(_hart_id: usize, slot_idx: usize) -> !
                     assert!(size_of::<ParallelWorkFn>() == size_of::<usize>());
                     assert!(align_of::<ParallelWorkFn>() <= align_of::<usize>());
                 };
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "worker handoff passes a ParallelWorkFn pointer as usize across the atomic slot ABI"
+                )]
                 let work_fn: ParallelWorkFn = {
                     // SAFETY: `fn_addr` was written by BSP from a valid `ParallelWorkFn`; the epoch
                     // handshake keeps the callable alive for the duration of this command.
