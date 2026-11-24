@@ -1,15 +1,40 @@
 //! Target execution abstraction isolating QEMU orchestration from future hardware board runners.
 
 use std::{
+    fmt,
     io::{BufRead, BufReader},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mbench_core::config::ClockRegime;
+
+/// Final OS exit status observed for a target session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionExit {
+    Exited(Option<i32>),
+    Killed,
+}
+
+impl SessionExit {
+    /// Returns `true` when the child exited normally with exit code `0`.
+    pub(crate) const fn is_clean_zero(self) -> bool {
+        matches!(self, Self::Exited(Some(0)))
+    }
+}
+
+impl fmt::Display for SessionExit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exited(Some(code)) => write!(f, "exit code {code}"),
+            Self::Exited(None) => f.write_str("terminated by signal"),
+            Self::Killed => f.write_str("killed after timeout or abort"),
+        }
+    }
+}
 
 /// Line or EOF event received from a running target serial stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,8 +59,11 @@ pub(crate) trait TargetSession {
     /// Polls for the next serial event up to `timeout`, returning `Ok(None)` on slice timeout.
     fn next_event(&mut self, timeout: Duration) -> Result<Option<SessionEvent>, String>;
 
-    /// Stops any live execution and reaps associated OS resources.
-    fn terminate_and_wait(&mut self);
+    /// Waits up to `timeout` for the child process to exit naturally without killing it.
+    fn wait_for_exit(&mut self, timeout: Duration) -> Result<Option<SessionExit>, String>;
+
+    /// Stops any live execution, reaps associated OS resources, and returns the exit status.
+    fn terminate_and_wait(&mut self) -> SessionExit;
 }
 
 /// Backend responsible for launching `mbench-target` on a concrete RISC-V platform.
@@ -127,7 +155,7 @@ impl TargetRunner for QemuVirtRunner {
             child,
             rx,
             reader: Some(reader),
-            finished: false,
+            exit: None,
         })
     }
 }
@@ -137,7 +165,22 @@ pub(crate) struct QemuVirtSession {
     child: Child,
     rx: Receiver<SessionEvent>,
     reader: Option<JoinHandle<()>>,
-    finished: bool,
+    exit: Option<SessionExit>,
+}
+
+impl QemuVirtSession {
+    fn join_reader(&mut self) {
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn record_exit(&mut self, status: ExitStatus) -> SessionExit {
+        let exit = SessionExit::Exited(status.code());
+        self.exit = Some(exit);
+        self.join_reader();
+        exit
+    }
 }
 
 impl TargetSession for QemuVirtSession {
@@ -149,23 +192,48 @@ impl TargetSession for QemuVirtSession {
         }
     }
 
-    fn terminate_and_wait(&mut self) {
-        if self.finished {
-            return;
+    fn wait_for_exit(&mut self, timeout: Duration) -> Result<Option<SessionExit>, String> {
+        if let Some(exit) = self.exit {
+            self.join_reader();
+            return Ok(Some(exit));
         }
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Ok(Some(self.record_exit(status))),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(format!("failed waiting for QEMU exit: {err}")),
+            }
         }
-        let _ = self.child.wait();
-        if let Some(handle) = self.reader.take() {
-            let _ = handle.join();
+    }
+
+    fn terminate_and_wait(&mut self) -> SessionExit {
+        if let Some(exit) = self.exit {
+            self.join_reader();
+            return exit;
         }
-        self.finished = true;
+        let exit = match self.child.try_wait() {
+            Ok(Some(status)) => SessionExit::Exited(status.code()),
+            Ok(None) | Err(_) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                SessionExit::Killed
+            }
+        };
+        self.exit = Some(exit);
+        self.join_reader();
+        exit
     }
 }
 
 impl Drop for QemuVirtSession {
     fn drop(&mut self) {
-        self.terminate_and_wait();
+        let _ = self.terminate_and_wait();
     }
 }

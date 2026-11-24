@@ -104,6 +104,14 @@ impl SbiExtensionId {
         }
     }
 
+    /// Parses a short canonical extension name (case-insensitive).
+    pub fn from_name(raw: &str) -> Option<Self> {
+        let lower = raw.trim();
+        Self::ALL
+            .into_iter()
+            .find(|ext| ext.name().eq_ignore_ascii_case(lower))
+    }
+
     /// Converts this extension to its bit position in [`SbiCapMask`].
     pub const fn as_flag(self) -> SbiCapMask {
         SbiCapMask::from_bits_retain(1u32 << (self as u8))

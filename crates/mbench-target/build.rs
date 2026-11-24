@@ -44,7 +44,15 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     println!("cargo:rerun-if-env-changed=MBENCH_LOAD_ADDR");
     println!("cargo:rerun-if-env-changed=MBENCH_TEXT_OFFSET");
+    println!("cargo:rerun-if-env-changed=MBENCH_DEFAULT_BOOTARGS");
     println!("cargo:rerun-if-changed=linker.ld.in");
+
+    let default_bootargs = env::var("MBENCH_DEFAULT_BOOTARGS").unwrap_or_default();
+    let trimmed_bootargs = default_bootargs.trim();
+    assert!(
+        !trimmed_bootargs.contains(['\r', '\n']),
+        "MBENCH_DEFAULT_BOOTARGS must be a single line"
+    );
 
     let load_addr = match env::var("MBENCH_LOAD_ADDR") {
         Ok(raw) => parse_load_addr(&raw),
@@ -66,6 +74,7 @@ fn main() {
 
     println!("cargo:rustc-env=MBENCH_LOAD_ADDR={formatted_addr}");
     println!("cargo:rustc-env=MBENCH_TEXT_OFFSET={formatted_offset}");
+    println!("cargo:rustc-env=MBENCH_DEFAULT_BOOTARGS={trimmed_bootargs}");
     println!("cargo:rustc-link-arg=-T{}", linker_path.display());
     println!("cargo:rustc-link-search={}", out_dir.display());
 }

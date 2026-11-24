@@ -16,4 +16,6 @@ pub mod protocol;
 pub mod record;
 pub mod stats;
 #[cfg(feature = "std")]
+pub mod validate;
+#[cfg(feature = "std")]
 pub mod wire;

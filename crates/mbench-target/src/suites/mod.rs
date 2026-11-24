@@ -49,7 +49,10 @@ pub(crate) fn empty_bench_loop(iters: u64) {
 
 /// Runs the `mbench` pipeline from metadata emission through mode-selected checks, benches, and shutdown.
 pub(crate) fn run_all(platform: &mut Platform) -> ! {
-    let cfg = RunConfig::parse_bootargs(platform.info().bootargs);
+    let cfg = RunConfig::parse_bootargs_with_defaults(
+        env!("MBENCH_DEFAULT_BOOTARGS"),
+        platform.info().bootargs,
+    );
     let mut con = platform.console();
     let meta = platform.meta_record();
     let _ = protocol::write_meta_line(&meta, &mut con);
