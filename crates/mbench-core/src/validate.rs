@@ -1,47 +1,133 @@
-//! Capture completeness, protocol integrity, and requirement-gating validator.
+//! Protocol integrity auditing and structured capture summary reports.
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    record::{BenchGroup, SbiExtensionId, SkipReason, StartKind},
+    record::{BenchGroup, EndRecord, SkipReason, StartKind},
     wire::{
-        BenchFrame, BenchStatusTag, CheckFrame, CheckStatusTag, StartFrame, WireFrame,
-        parse_capture, parse_wire_line,
+        AttemptRecord, BenchFrame, BenchStatusTag, CheckFrame, CheckStatusTag, EndFrame, EnvLine,
+        MetaFrame, PanicFrame, StartFrame, WireFrame, parse_capture, parse_wire_line,
     },
 };
 
-/// Validation constraints enforced against a saved `.jsonl` capture or raw serial log.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ValidationPolicy {
-    pub require_closed_starts: bool,
-    pub expect_harts: Option<usize>,
-    pub require_extensions: Vec<SbiExtensionId>,
-    pub require_check_pass: Vec<String>,
-    pub min_checks_passed: Option<usize>,
-    pub min_effective_benches: Option<usize>,
-    pub min_smp_effective_benches: Option<usize>,
-    pub max_quarantine_warnings: Option<usize>,
-    pub forbidden_patterns: Vec<String>,
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
-/// Summary metrics extracted from a validated capture.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ValidationSummary {
-    pub hart_count: usize,
-    pub extensions_count: usize,
+/// Source format detected for an audited capture.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureFormat {
+    RawSerial,
+    MergedJsonl,
+}
+
+/// Aggregated counts extracted from parsed capture records.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CaptureCounts {
     pub checks_total: usize,
     pub checks_passed: usize,
     pub checks_skipped: usize,
     pub checks_failed: usize,
+    pub check_assertions_total: u64,
+    pub check_assertions_passed: u64,
+    pub check_assertions_failed: u64,
     pub benches_total: usize,
+    pub benches_passed: usize,
+    pub benches_hw_native: usize,
+    pub benches_delegated: usize,
     pub benches_effective: usize,
-    pub benches_smp_effective: usize,
     pub benches_skipped: usize,
     pub benches_failed: usize,
     pub quarantine_warnings: usize,
 }
 
-/// Returns `true` when a benchmark status represents a real measured or native/delegated outcome.
+impl CaptureCounts {
+    fn from_end(end: &EndRecord) -> Self {
+        Self {
+            checks_total: end.checks_total,
+            checks_passed: end.checks_passed,
+            checks_skipped: end.checks_skipped,
+            checks_failed: end.checks_failed,
+            check_assertions_total: end.check_assertions_total,
+            check_assertions_passed: end.check_assertions_passed,
+            check_assertions_failed: end.check_assertions_failed,
+            benches_total: end.benches_total,
+            benches_passed: end.benches_passed,
+            benches_hw_native: end.benches_hw_native,
+            benches_delegated: end.benches_delegated,
+            benches_effective: end
+                .benches_passed
+                .saturating_add(end.benches_hw_native)
+                .saturating_add(end.benches_delegated),
+            benches_skipped: end.benches_skipped,
+            benches_failed: end.benches_failed,
+            quarantine_warnings: end.quarantine_warnings,
+        }
+    }
+}
+
+/// Per-check summary entry exposed inside [`CaptureReport`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckSummary {
+    pub id: String,
+    pub status: CheckStatusTag,
+    pub checks: u64,
+    pub checks_total: u64,
+    pub checks_failed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<SkipReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_reason: Option<String>,
+    pub quirks: u8,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub synthetic: bool,
+}
+
+/// Per-benchmark summary entry exposed inside [`CaptureReport`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BenchSummary {
+    pub id: String,
+    pub group: BenchGroup,
+    pub parallel: usize,
+    pub status: BenchStatusTag,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<SkipReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub synthetic: bool,
+}
+
+/// Machine-readable protocol audit and experiment report exported for downstream consumers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CaptureReport {
+    pub source: String,
+    pub format: CaptureFormat,
+    pub protocol_valid: bool,
+    pub completed: bool,
+    pub recovered: bool,
+    pub protocol_errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<EnvLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<MetaFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panic: Option<PanicFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<EndFrame>,
+    pub counts: CaptureCounts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<AttemptRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CheckSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benches: Vec<BenchSummary>,
+}
+
+/// Returns `true` when a benchmark status represents a non-skipped measured or native/delegated result.
 pub const fn is_effective_bench_status(status: BenchStatusTag) -> bool {
     matches!(
         status,
@@ -49,403 +135,411 @@ pub const fn is_effective_bench_status(status: BenchStatusTag) -> bool {
     )
 }
 
-/// Returns `true` when a benchmark exercises multi-hart concurrency or scaling.
-pub const fn is_smp_bench(bench: &BenchFrame) -> bool {
-    bench.parallel >= 2
-        || matches!(
-            bench.group,
-            BenchGroup::Spi | BenchGroup::Rfnc | BenchGroup::Scale
-        )
+/// Summarizes check and benchmark records into a matching [`EndRecord`].
+pub fn summarize_records(
+    checks: &[CheckFrame],
+    benches: &[BenchFrame],
+    quarantine_warnings: usize,
+) -> EndRecord {
+    let mut end = EndRecord {
+        quarantine_warnings,
+        ..EndRecord::default()
+    };
+    for chk in checks {
+        end.checks_total = end.checks_total.saturating_add(1);
+        match chk.status {
+            CheckStatusTag::Pass => end.checks_passed += 1,
+            CheckStatusTag::Skipped => end.checks_skipped += 1,
+            CheckStatusTag::Fail => end.checks_failed += 1,
+        }
+        let case_total = chk
+            .checks_total
+            .max(chk.checks.saturating_add(chk.checks_failed));
+        end.check_assertions_total = end.check_assertions_total.saturating_add(case_total);
+        end.check_assertions_passed = end.check_assertions_passed.saturating_add(chk.checks);
+        end.check_assertions_failed = end
+            .check_assertions_failed
+            .saturating_add(chk.checks_failed);
+    }
+    for bench in benches {
+        end.benches_total = end.benches_total.saturating_add(1);
+        match bench.status {
+            BenchStatusTag::Pass => end.benches_passed += 1,
+            BenchStatusTag::Skipped => end.benches_skipped += 1,
+            BenchStatusTag::HwNative => end.benches_hw_native += 1,
+            BenchStatusTag::DelegatedToS => end.benches_delegated += 1,
+            BenchStatusTag::Fail => end.benches_failed += 1,
+        }
+    }
+    end
 }
 
-/// Parses a forbidden-pattern file (one fixed substring per line, ignoring blank and `#` lines).
-///
-/// Fails closed when the file contains zero active patterns.
-pub fn parse_forbidden_patterns(content: &str) -> Result<Vec<String>, String> {
-    let patterns: Vec<String> = content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(String::from)
-        .collect();
-    if patterns.is_empty() {
-        return Err(String::from(
-            "forbidden pattern file contains no active patterns",
-        ));
-    }
-    Ok(patterns)
+/// Audits a single raw serial execution attempt for framing, START/result closure, and END integrity.
+pub fn audit_raw_attempt(raw_lines: &[String], expect_end: bool) -> Vec<String> {
+    let lines: Vec<&str> = raw_lines.iter().map(String::as_str).collect();
+    audit_stream_lines(&lines, true, expect_end)
 }
 
-/// Validates wire integrity, END accounting, and policy requirements on a capture or serial log.
-pub fn validate_capture(
-    text: &str,
-    policy: &ValidationPolicy,
-) -> Result<ValidationSummary, Vec<String>> {
-    let mut errors = Vec::new();
-
-    check_forbidden_lines(text, &policy.forbidden_patterns, &mut errors);
-    audit_stream_framing(text, policy.require_closed_starts, &mut errors);
-
-    let cap = match parse_capture("capture", text) {
-        Ok(c) => c,
-        Err(err) => {
-            errors.push(format!("capture parse failed: {err}"));
-            return Err(errors);
-        }
-    };
-
-    if let Some(panic) = &cap.panic {
-        errors.push(format!(
-            "target panicked during capture (reason={:?}, message={:?}, scause={:?}, sepc={:?})",
-            panic.reason, panic.message, panic.scause, panic.sepc
-        ));
-    }
-
-    let mut summary = ValidationSummary::default();
-
-    let Some(meta) = &cap.meta else {
-        errors.push(String::from("missing @@MBENCH:META frame"));
-        return Err(errors);
-    };
-    summary.hart_count = meta.hart_count;
-    summary.extensions_count = meta.extensions.len();
-
-    let Some(end) = cap.end else {
-        errors.push(String::from("missing @@MBENCH:END frame"));
-        return Err(errors);
-    };
-
-    let check_counts = count_checks(&cap.checks, &mut errors);
-    let bench_counts = count_benches(&cap.benches, &mut errors);
-
-    summary.checks_total = check_counts.total;
-    summary.checks_passed = check_counts.passed;
-    summary.checks_skipped = check_counts.skipped;
-    summary.checks_failed = check_counts.failed;
-    summary.benches_total = bench_counts.total;
-    summary.benches_effective = bench_counts.effective;
-    summary.benches_smp_effective = bench_counts.smp_effective;
-    summary.benches_skipped = bench_counts.skipped;
-    summary.benches_failed = bench_counts.failed;
-    summary.quarantine_warnings = end.quarantine_warnings;
-
-    verify_end_consistency(&end, &check_counts, &bench_counts, &mut errors);
-
-    if let Some(max_warn) = policy.max_quarantine_warnings
-        && end.quarantine_warnings > max_warn
-    {
-        errors.push(format!(
-            "quarantine_warnings ({}) exceeds maximum allowed ({max_warn})",
-            end.quarantine_warnings
-        ));
-    }
-
-    if let Some(expected_harts) = policy.expect_harts
-        && meta.hart_count != expected_harts
-    {
-        errors.push(format!(
-            "expected hart_count={expected_harts}, observed {}",
-            meta.hart_count
-        ));
-    }
-
-    for ext in &policy.require_extensions {
-        if !meta.extensions.contains(ext) {
-            errors.push(format!("missing required SBI extension '{}'", ext.name()));
-        }
-    }
-
-    let check_map: BTreeMap<&str, &CheckFrame> =
-        cap.checks.iter().map(|c| (c.id.as_str(), c)).collect();
-    for id in &policy.require_check_pass {
-        match check_map.get(id.as_str()) {
-            None => errors.push(format!("missing required check '{id}'")),
-            Some(chk) if chk.status != CheckStatusTag::Pass => errors.push(format!(
-                "required check '{id}' did not PASS (status={:?}, skip_reason={:?}, fail_reason={:?})",
-                chk.status, chk.skip_reason, chk.fail_reason
-            )),
-            Some(_) => {}
-        }
-    }
-
-    if let Some(min_passed) = policy.min_checks_passed
-        && check_counts.passed < min_passed
-    {
-        errors.push(format!(
-            "checks_passed ({}) is below required minimum ({min_passed})",
-            check_counts.passed
-        ));
-    }
-
-    if let Some(min_eff) = policy.min_effective_benches
-        && bench_counts.effective < min_eff
-    {
-        errors.push(format!(
-            "effective benchmarks ({}) is below required minimum ({min_eff})",
-            bench_counts.effective
-        ));
-    }
-
-    if let Some(min_smp_eff) = policy.min_smp_effective_benches
-        && bench_counts.smp_effective < min_smp_eff
-    {
-        errors.push(format!(
-            "effective SMP benchmarks ({}) is below required minimum ({min_smp_eff})",
-            bench_counts.smp_effective
-        ));
-    }
-
-    if errors.is_empty() {
-        Ok(summary)
+/// Audits a saved `.jsonl` capture or raw serial log and exports a structured [`CaptureReport`].
+pub fn audit_capture(source: &str, text: &str) -> CaptureReport {
+    let lines: Vec<&str> = text.lines().collect();
+    let is_merged = lines
+        .iter()
+        .any(|line| line.starts_with("# MBENCH_ENV ") || line.starts_with("# MBENCH_ATTEMPT "));
+    let format = if is_merged {
+        CaptureFormat::MergedJsonl
     } else {
-        Err(errors)
-    }
-}
+        CaptureFormat::RawSerial
+    };
 
-fn check_forbidden_lines(text: &str, patterns: &[String], errors: &mut Vec<String>) {
-    if patterns.is_empty() {
-        return;
-    }
-    for (line_idx, line) in text.lines().enumerate() {
-        for pat in patterns {
-            if !pat.is_empty() && line.contains(pat.as_str()) {
-                errors.push(format!(
-                    "forbidden pattern '{pat}' matched at line {}: {}",
-                    line_idx + 1,
-                    line.trim()
-                ));
+    let mut protocol_errors = match format {
+        CaptureFormat::RawSerial => audit_stream_lines(&lines, true, true),
+        CaptureFormat::MergedJsonl => audit_stream_lines(&lines, false, true),
+    };
+
+    let parsed = match parse_capture(source, text) {
+        Ok(cap) => cap,
+        Err(err) => {
+            if protocol_errors.is_empty() {
+                protocol_errors.push(format!("capture parse failed: {err}"));
             }
+            return CaptureReport {
+                source: source.to_string(),
+                format,
+                protocol_valid: false,
+                completed: false,
+                recovered: false,
+                protocol_errors,
+                env: None,
+                meta: None,
+                panic: None,
+                end: None,
+                counts: CaptureCounts::default(),
+                attempts: Vec::new(),
+                checks: Vec::new(),
+                benches: Vec::new(),
+            };
+        }
+    };
+
+    for attempt in &parsed.attempts {
+        for err in &attempt.protocol_errors {
+            protocol_errors.push(format!("attempt {}: {err}", attempt.attempt));
         }
     }
+
+    if let Some(end) = &parsed.end {
+        let computed = summarize_records(&parsed.checks, &parsed.benches, end.quarantine_warnings);
+        if format == CaptureFormat::MergedJsonl {
+            compare_end_counts("merged capture", &computed, end, &mut protocol_errors);
+        }
+    }
+
+    let computed_counts = summarize_records(
+        &parsed.checks,
+        &parsed.benches,
+        parsed.end.map_or(0, |e| e.quarantine_warnings),
+    );
+    let recovered = parsed.attempts.len() > 1
+        || parsed.checks.iter().any(|c| c.synthetic)
+        || parsed.benches.iter().any(|b| b.synthetic);
+    let last_attempt_complete = parsed.attempts.last().is_none_or(|attempt| attempt.saw_end);
+    let completed = match format {
+        CaptureFormat::RawSerial => parsed.end.is_some() && parsed.panic.is_none(),
+        CaptureFormat::MergedJsonl => parsed.end.is_some() && last_attempt_complete,
+    };
+
+    let checks = parsed
+        .checks
+        .into_iter()
+        .map(|chk| CheckSummary {
+            id: chk.id,
+            status: chk.status,
+            checks: chk.checks,
+            checks_total: chk.checks_total,
+            checks_failed: chk.checks_failed,
+            skip_reason: chk.skip_reason,
+            fail_reason: chk.fail_reason,
+            quirks: chk.quirks,
+            synthetic: chk.synthetic,
+        })
+        .collect();
+    let benches = parsed
+        .benches
+        .into_iter()
+        .map(|bench| BenchSummary {
+            id: bench.id,
+            group: bench.group,
+            parallel: bench.parallel,
+            status: bench.status,
+            skip_reason: bench.skip_reason,
+            fail_reason: bench.fail_reason,
+            synthetic: bench.synthetic,
+        })
+        .collect();
+
+    CaptureReport {
+        source: parsed.label,
+        format,
+        protocol_valid: protocol_errors.is_empty(),
+        completed,
+        recovered,
+        protocol_errors,
+        env: parsed.env,
+        meta: parsed.meta,
+        panic: parsed.panic,
+        end: parsed.end,
+        counts: CaptureCounts::from_end(&computed_counts),
+        attempts: parsed.attempts,
+        checks,
+        benches,
+    }
 }
 
-fn audit_stream_framing(text: &str, require_closed_starts: bool, errors: &mut Vec<String>) {
+fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool) -> Vec<String> {
+    let mut errors = Vec::new();
     let mut open_starts: Vec<StartFrame> = Vec::new();
-    let mut end_count = 0usize;
+    let mut raw_checks: Vec<CheckFrame> = Vec::new();
+    let mut raw_benches: Vec<BenchFrame> = Vec::new();
+    let mut seen_check_keys: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen_bench_keys: BTreeMap<(String, usize), usize> = BTreeMap::new();
+    let mut meta_count = 0usize;
+    let mut saw_end = false;
+    let mut saw_panic = false;
 
-    for (idx, raw_line) in text.lines().enumerate() {
+    for (idx, raw_line) in lines.iter().enumerate() {
         let line_no = idx + 1;
-        let has_wire_marker = raw_line.contains("@@MBENCH:");
-        let parsed = match parse_wire_line(raw_line) {
-            Ok(Some(frame)) => frame,
+        let has_mbench_prefix = raw_line.contains("@@MBENCH:");
+        let frame = match parse_wire_line(raw_line) {
+            Ok(Some(f)) => f,
             Ok(None) => {
-                if has_wire_marker {
+                if has_mbench_prefix {
                     errors.push(format!(
-                        "malformed or unrecognized @@MBENCH wire line at line {line_no}"
+                        "line {line_no}: malformed or unknown @@MBENCH directive"
                     ));
                 }
                 continue;
             }
             Err(err) => {
-                errors.push(format!("invalid wire frame at line {line_no}: {err}"));
+                errors.push(format!("line {line_no}: {err}"));
                 continue;
             }
         };
 
-        if end_count > 0 && !matches!(parsed, WireFrame::Env(_) | WireFrame::Panic(_)) {
-            errors.push(format!(
-                "unexpected wire frame after @@MBENCH:END at line {line_no}"
-            ));
-        }
-
-        match parsed {
-            WireFrame::Start(start) => {
-                let exists = open_starts.iter().any(|s| {
-                    s.kind == start.kind && s.id == start.id && s.parallel == start.parallel
-                });
-                if !exists {
-                    open_starts.push(start);
-                }
-            }
-            WireFrame::Check(chk) => {
-                if chk.skip_reason != Some(SkipReason::ResumedPast) {
-                    open_starts.retain(|s| !(s.kind == StartKind::Check && s.id == chk.id));
-                }
-            }
-            WireFrame::Bench(b) => {
-                if b.skip_reason != Some(SkipReason::ResumedPast) {
-                    open_starts.retain(|s| {
-                        !(s.kind == StartKind::Bench && s.id == b.id && s.parallel == b.parallel)
-                    });
-                }
-            }
-            WireFrame::End(_) => {
-                end_count += 1;
-                if require_closed_starts && !open_starts.is_empty() {
-                    for unclosed in open_starts.drain(..) {
+        match frame {
+            WireFrame::Env(_) | WireFrame::Attempt(_) => {}
+            WireFrame::Meta(_) => {
+                if saw_end {
+                    errors.push(format!(
+                        "line {line_no}: unexpected @@MBENCH:META frame after END"
+                    ));
+                } else {
+                    meta_count += 1;
+                    if raw_single_attempt && meta_count > 1 {
                         errors.push(format!(
-                            "unclosed @@MBENCH:START before END: {:?} '{}' (p={})",
-                            unclosed.kind, unclosed.id, unclosed.parallel
+                            "line {line_no}: duplicate @@MBENCH:META frame in single attempt"
                         ));
                     }
                 }
             }
-            WireFrame::Env(_) | WireFrame::Meta(_) | WireFrame::Cal(_) | WireFrame::Panic(_) => {}
+            WireFrame::Cal(_) => {
+                if saw_end {
+                    errors.push(format!(
+                        "line {line_no}: unexpected @@MBENCH:CAL frame after END"
+                    ));
+                }
+            }
+            WireFrame::Start(start) => {
+                if saw_end {
+                    errors.push(format!(
+                        "line {line_no}: unexpected @@MBENCH:START frame after END ('{}')",
+                        start.id
+                    ));
+                } else {
+                    open_starts.push(start);
+                }
+            }
+            WireFrame::Check(chk) => {
+                if saw_end {
+                    errors.push(format!(
+                        "line {line_no}: unexpected @@MBENCH:CHECK frame after END ('{}')",
+                        chk.id
+                    ));
+                } else {
+                    if let Some(pos) = open_starts
+                        .iter()
+                        .position(|s| s.kind == StartKind::Check && s.id == chk.id)
+                    {
+                        open_starts.remove(pos);
+                    }
+                    if raw_single_attempt {
+                        if let Some(prev_line) = seen_check_keys.insert(chk.id.clone(), line_no) {
+                            errors.push(format!(
+                                "line {line_no}: duplicate CHECK frame for '{}' (first seen at line {prev_line})",
+                                chk.id
+                            ));
+                        }
+                        raw_checks.push(chk);
+                    }
+                }
+            }
+            WireFrame::Bench(bench) => {
+                if saw_end {
+                    errors.push(format!(
+                        "line {line_no}: unexpected @@MBENCH:BENCH frame after END ('{}')",
+                        bench.id
+                    ));
+                } else {
+                    if let Some(pos) = open_starts.iter().position(|s| {
+                        s.kind == StartKind::Bench
+                            && s.id == bench.id
+                            && s.parallel == bench.parallel
+                    }) {
+                        open_starts.remove(pos);
+                    }
+                    if raw_single_attempt {
+                        let key = (bench.id.clone(), bench.parallel);
+                        if let Some(prev_line) = seen_bench_keys.insert(key, line_no) {
+                            errors.push(format!(
+                                "line {line_no}: duplicate BENCH frame for '{}' (parallel={}, first seen at line {prev_line})",
+                                bench.id, bench.parallel
+                            ));
+                        }
+                        raw_benches.push(*bench);
+                    }
+                }
+            }
+            WireFrame::End(end) => {
+                if saw_end {
+                    errors.push(format!("line {line_no}: duplicate @@MBENCH:END frame"));
+                } else {
+                    saw_end = true;
+                    for unclosed in open_starts.drain(..) {
+                        errors.push(format!(
+                            "line {line_no}: unclosed @@MBENCH:START frame before END ({:?} '{}', parallel={})",
+                            unclosed.kind, unclosed.id, unclosed.parallel
+                        ));
+                    }
+                    if raw_single_attempt {
+                        let computed =
+                            summarize_records(&raw_checks, &raw_benches, end.quarantine_warnings);
+                        compare_end_counts(
+                            &format!("line {line_no}"),
+                            &computed,
+                            &end,
+                            &mut errors,
+                        );
+                    }
+                }
+            }
+            WireFrame::Panic(_) => {
+                if saw_end {
+                    errors.push(format!(
+                        "line {line_no}: unexpected @@MBENCH:PANIC frame after END"
+                    ));
+                }
+                saw_panic = true;
+            }
         }
     }
 
-    if require_closed_starts {
+    if expect_end {
+        if meta_count == 0 && !saw_panic {
+            errors.push(String::from("missing @@MBENCH:META frame"));
+        }
+        if !saw_end {
+            errors.push(String::from("missing @@MBENCH:END frame"));
+        }
         for unclosed in open_starts {
             errors.push(format!(
-                "unclosed @@MBENCH:START at end of log: {:?} '{}' (p={})",
+                "unclosed @@MBENCH:START frame at EOF ({:?} '{}', parallel={})",
                 unclosed.kind, unclosed.id, unclosed.parallel
             ));
         }
     }
 
-    if end_count > 1 {
-        errors.push(format!(
-            "expected a single @@MBENCH:END frame, found {end_count}"
-        ));
-    }
+    errors
 }
 
-struct CheckCounts {
-    total: usize,
-    passed: usize,
-    skipped: usize,
-    failed: usize,
-}
-
-fn count_checks(checks: &[CheckFrame], errors: &mut Vec<String>) -> CheckCounts {
-    let mut counts = CheckCounts {
-        total: checks.len(),
-        passed: 0,
-        skipped: 0,
-        failed: 0,
-    };
-    for chk in checks {
-        match chk.status {
-            CheckStatusTag::Pass => {
-                if chk.checks_failed > 0 {
-                    errors.push(format!(
-                        "check '{}' reported PASS with checks_failed={}",
-                        chk.id, chk.checks_failed
-                    ));
-                }
-                counts.passed += 1;
-            }
-            CheckStatusTag::Skipped => counts.skipped += 1,
-            CheckStatusTag::Fail => {
-                counts.failed += 1;
-                errors.push(format!(
-                    "check '{}' FAILED ({}; passed={}/{})",
-                    chk.id,
-                    chk.fail_reason.as_deref().unwrap_or("unknown"),
-                    chk.checks,
-                    chk.checks_total
-                ));
-            }
-        }
-    }
-    counts
-}
-
-struct BenchCounts {
-    total: usize,
-    passed: usize,
-    skipped: usize,
-    hw_native: usize,
-    delegated: usize,
-    failed: usize,
-    effective: usize,
-    smp_effective: usize,
-}
-
-fn count_benches(benches: &[BenchFrame], errors: &mut Vec<String>) -> BenchCounts {
-    let mut counts = BenchCounts {
-        total: benches.len(),
-        passed: 0,
-        skipped: 0,
-        hw_native: 0,
-        delegated: 0,
-        failed: 0,
-        effective: 0,
-        smp_effective: 0,
-    };
-    for bench in benches {
-        match bench.status {
-            BenchStatusTag::Pass => counts.passed += 1,
-            BenchStatusTag::Skipped => counts.skipped += 1,
-            BenchStatusTag::HwNative => counts.hw_native += 1,
-            BenchStatusTag::DelegatedToS => counts.delegated += 1,
-            BenchStatusTag::Fail => {
-                counts.failed += 1;
-                errors.push(format!(
-                    "benchmark '{}' (p={}) FAILED ({})",
-                    bench.id,
-                    bench.parallel,
-                    bench.fail_reason.as_deref().unwrap_or("unknown")
-                ));
-            }
-        }
-        if is_effective_bench_status(bench.status) {
-            counts.effective += 1;
-            if is_smp_bench(bench) {
-                counts.smp_effective += 1;
-            }
-        }
-    }
-    counts
-}
-
-fn verify_end_consistency(
-    end: &crate::record::EndRecord,
-    checks: &CheckCounts,
-    benches: &BenchCounts,
+fn compare_end_counts(
+    context: &str,
+    computed: &EndRecord,
+    recorded: &EndRecord,
     errors: &mut Vec<String>,
 ) {
-    if end.checks_failed > 0 && checks.failed == 0 {
-        errors.push(format!(
-            "END reports checks_failed={}, though no failing check frames were captured",
-            end.checks_failed
-        ));
-    }
-    if end.benches_failed > 0 && benches.failed == 0 {
-        errors.push(format!(
-            "END reports benches_failed={}, though no failing benchmark frames were captured",
-            end.benches_failed
-        ));
-    }
-    if end.checks_total != checks.total
-        || end.checks_passed != checks.passed
-        || end.checks_skipped != checks.skipped
-        || end.checks_failed != checks.failed
-    {
-        errors.push(format!(
-            "END check counts ({}/{}/{}/{}) do not match captured check frames ({}/{}/{}/{})",
-            end.checks_total,
-            end.checks_passed,
-            end.checks_skipped,
-            end.checks_failed,
-            checks.total,
-            checks.passed,
-            checks.skipped,
-            checks.failed
-        ));
-    }
-    if end.benches_total != benches.total
-        || end.benches_passed != benches.passed
-        || end.benches_skipped != benches.skipped
-        || end.benches_hw_native != benches.hw_native
-        || end.benches_delegated != benches.delegated
-        || end.benches_failed != benches.failed
-    {
-        errors.push(format!(
-            "END benchmark counts ({}/{}/{}/{}/{}/{}) do not match captured frames ({}/{}/{}/{}/{}/{})",
-            end.benches_total,
-            end.benches_passed,
-            end.benches_skipped,
-            end.benches_hw_native,
-            end.benches_delegated,
-            end.benches_failed,
-            benches.total,
-            benches.passed,
-            benches.skipped,
-            benches.hw_native,
-            benches.delegated,
-            benches.failed
-        ));
+    let fields = [
+        (
+            "checks_total",
+            computed.checks_total as u64,
+            recorded.checks_total as u64,
+        ),
+        (
+            "checks_passed",
+            computed.checks_passed as u64,
+            recorded.checks_passed as u64,
+        ),
+        (
+            "checks_skipped",
+            computed.checks_skipped as u64,
+            recorded.checks_skipped as u64,
+        ),
+        (
+            "checks_failed",
+            computed.checks_failed as u64,
+            recorded.checks_failed as u64,
+        ),
+        (
+            "check_assertions_total",
+            computed.check_assertions_total,
+            recorded.check_assertions_total,
+        ),
+        (
+            "check_assertions_passed",
+            computed.check_assertions_passed,
+            recorded.check_assertions_passed,
+        ),
+        (
+            "check_assertions_failed",
+            computed.check_assertions_failed,
+            recorded.check_assertions_failed,
+        ),
+        (
+            "benches_total",
+            computed.benches_total as u64,
+            recorded.benches_total as u64,
+        ),
+        (
+            "benches_passed",
+            computed.benches_passed as u64,
+            recorded.benches_passed as u64,
+        ),
+        (
+            "benches_skipped",
+            computed.benches_skipped as u64,
+            recorded.benches_skipped as u64,
+        ),
+        (
+            "benches_hw_native",
+            computed.benches_hw_native as u64,
+            recorded.benches_hw_native as u64,
+        ),
+        (
+            "benches_delegated",
+            computed.benches_delegated as u64,
+            recorded.benches_delegated as u64,
+        ),
+        (
+            "benches_failed",
+            computed.benches_failed as u64,
+            recorded.benches_failed as u64,
+        ),
+    ];
+    for (name, got, want) in fields {
+        if got != want {
+            errors.push(format!(
+                "{context}: END {name}={want} does not match emitted records ({got})"
+            ));
+        }
     }
 }
 
@@ -453,15 +547,18 @@ fn verify_end_consistency(
 mod tests {
     use super::*;
     use crate::{
+        config::RunConfig,
         protocol,
         record::{
-            BenchResult, BenchStatus, CheckIssues, CheckResult, CheckStatus, CounterAvailability,
-            EndRecord, FailReason, MetaRecord, SbiCapMask,
+            BenchResult, BenchStatus, CalibrationRecord, CheckIssues, CheckResult, CheckStatus,
+            CounterAvailability, FailReason, MetaRecord, SbiCapMask, SbiExtensionId,
         },
         stats,
+        wire::ShutdownStatus,
     };
 
     fn sample_meta(harts: usize, extensions: SbiCapMask) -> String {
+        let mut out = String::new();
         let meta = MetaRecord {
             sbi_spec_version: 0x0300_0000,
             impl_id: 4,
@@ -487,8 +584,8 @@ mod tests {
             console_backend: "dbcn",
             pmu_counter_count: 16,
             load_addr: 0x8020_0000,
+            config: RunConfig::default(),
         };
-        let mut out = String::new();
         protocol::write_meta_line(&meta, &mut out).unwrap();
         out
     }
@@ -496,16 +593,13 @@ mod tests {
     fn check_line(id: &str, status: CheckStatus) -> String {
         let mut out = String::new();
         protocol::write_start_line(StartKind::Check, id, 1, &mut out).unwrap();
+        let failed = matches!(status, CheckStatus::Failed(_)) as u64;
         protocol::write_check_line(
             &CheckResult {
                 id,
                 checks: if status == CheckStatus::Pass { 5 } else { 0 },
                 checks_total: 5,
-                checks_failed: if matches!(status, CheckStatus::Failed(_)) {
-                    1
-                } else {
-                    0
-                },
+                checks_failed: failed,
                 status,
                 issues: CheckIssues::new(),
                 quirks: 0,
@@ -556,153 +650,205 @@ mod tests {
     }
 
     #[test]
-    fn validates_pass_and_rejects_protocol_and_gating_failures() {
+    fn audits_raw_captures_and_detects_protocol_defects() {
+        let mut cal = String::new();
+        protocol::write_cal_line(&CalibrationRecord::default(), &mut cal).unwrap();
+
         let mut ok_log = sample_meta(4, SbiCapMask::BASE | SbiCapMask::HSM);
+        ok_log.push_str(&cal);
         ok_log.push_str(&check_line("conformance/base", CheckStatus::Pass));
-        ok_log.push_str(&check_line("conformance/hsm", CheckStatus::Pass));
+        ok_log.push_str(&check_line(
+            "conformance/rfnc",
+            CheckStatus::Failed(FailReason::UnexpectedSbiError(-2)),
+        ));
         ok_log.push_str(&bench_line(
-            "scale/base_ecall",
-            BenchGroup::Scale,
-            4,
+            "base/get_spec_version",
+            BenchGroup::Base,
+            1,
             BenchStatus::Pass,
         ));
         ok_log.push_str(&bench_line(
-            "trap/misaligned_load",
-            BenchGroup::TrapEmul,
-            1,
-            BenchStatus::HwNative,
+            "rfnc/sfence_vma.all",
+            BenchGroup::Rfnc,
+            4,
+            BenchStatus::Failed(FailReason::Timeout),
         ));
         ok_log.push_str(&end_line(EndRecord {
             checks_total: 2,
-            checks_passed: 2,
+            checks_passed: 1,
+            checks_skipped: 0,
+            checks_failed: 1,
             check_assertions_total: 10,
-            check_assertions_passed: 10,
+            check_assertions_passed: 5,
+            check_assertions_failed: 1,
             benches_total: 2,
             benches_passed: 1,
-            benches_hw_native: 1,
-            ..EndRecord::default()
+            benches_skipped: 0,
+            benches_hw_native: 0,
+            benches_delegated: 0,
+            benches_failed: 1,
+            quarantine_warnings: 0,
         }));
 
-        let policy = ValidationPolicy {
-            require_closed_starts: true,
-            expect_harts: Some(4),
-            require_extensions: vec![SbiExtensionId::Base, SbiExtensionId::Hsm],
-            require_check_pass: vec![
-                String::from("conformance/base"),
-                String::from("conformance/hsm"),
-            ],
-            min_checks_passed: Some(2),
-            min_effective_benches: Some(2),
-            min_smp_effective_benches: Some(1),
-            max_quarantine_warnings: Some(0),
-            forbidden_patterns: parse_forbidden_patterns("# comment\npanicked\nFAILED\n").unwrap(),
-        };
-        let summary = validate_capture(&ok_log, &policy).unwrap();
-        assert_eq!(summary.hart_count, 4);
-        assert_eq!(summary.checks_passed, 2);
-        assert_eq!(summary.benches_effective, 2);
-        assert_eq!(summary.benches_smp_effective, 1);
-
-        // Missing extension & skipped required check must fail even if base passes.
-        let mut skipped_hsm = sample_meta(4, SbiCapMask::BASE);
-        skipped_hsm.push_str(&check_line("conformance/base", CheckStatus::Pass));
-        skipped_hsm.push_str(&check_line(
-            "conformance/hsm",
-            CheckStatus::Skipped(SkipReason::ExtensionUnsupported),
-        ));
-        skipped_hsm.push_str(&end_line(EndRecord {
-            checks_total: 2,
-            checks_passed: 1,
-            checks_skipped: 1,
-            ..EndRecord::default()
-        }));
-        let errs = validate_capture(&skipped_hsm, &policy).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("missing required SBI extension 'hsm'"))
-        );
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("required check 'conformance/hsm' did not PASS"))
+        // Valid wire protocol with failing cases still produces a clean, complete report.
+        let report = audit_capture("ok", &ok_log);
+        assert_eq!(report.format, CaptureFormat::RawSerial);
+        assert!(report.protocol_valid, "{:?}", report.protocol_errors);
+        assert!(report.completed);
+        assert!(!report.recovered);
+        assert_eq!(report.counts.checks_failed, 1);
+        assert_eq!(report.counts.benches_failed, 1);
+        assert_eq!(report.counts.benches_effective, 1);
+        assert_eq!(
+            report.meta.as_ref().unwrap().extensions,
+            vec![SbiExtensionId::Base, SbiExtensionId::Hsm]
         );
 
-        // All-skipped benchmarks must fail min_effective_benches even when benches_total > 0.
-        let mut all_skipped_bench = sample_meta(4, SbiCapMask::BASE);
-        all_skipped_bench.push_str(&bench_line(
-            "base/get_spec_version",
-            BenchGroup::Base,
-            1,
-            BenchStatus::Skipped(SkipReason::FilteredOut),
-        ));
-        all_skipped_bench.push_str(&end_line(EndRecord {
-            benches_total: 1,
-            benches_skipped: 1,
-            ..EndRecord::default()
-        }));
-        let bench_policy = ValidationPolicy {
-            min_effective_benches: Some(1),
-            ..ValidationPolicy::default()
-        };
-        let errs = validate_capture(&all_skipped_bench, &bench_policy).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("effective benchmarks (0)")));
-
-        // Unclosed START before END must fail when require_closed_starts is enabled.
+        // Unclosed START before END fails protocol validation.
         let mut unclosed = sample_meta(1, SbiCapMask::BASE);
         protocol::write_start_line(StartKind::Check, "conformance/base", 1, &mut unclosed).unwrap();
         unclosed.push_str(&end_line(EndRecord::default()));
-        let strict_starts = ValidationPolicy {
-            require_closed_starts: true,
-            ..ValidationPolicy::default()
-        };
-        let errs = validate_capture(&unclosed, &strict_starts).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("unclosed @@MBENCH:START")));
-
-        // Nonzero quarantine warnings, PANIC, forbidden pattern, and missing END must all fail.
-        let mut bad_misc = ok_log.replace("\"quarantine_warnings\":0", "\"quarantine_warnings\":1");
-        bad_misc = format!("Firmware panicked here!\n{bad_misc}");
-        protocol::write_panic_line("boom", &mut bad_misc).unwrap();
-        let errs = validate_capture(&bad_misc, &policy).unwrap_err();
+        let unclosed_report = audit_capture("unclosed", &unclosed);
+        assert!(!unclosed_report.protocol_valid);
         assert!(
-            errs.iter()
-                .any(|e| e.contains("forbidden pattern 'panicked'"))
+            unclosed_report
+                .protocol_errors
+                .iter()
+                .any(|e| e.contains("unclosed @@MBENCH:START"))
         );
-        assert!(errs.iter().any(|e| e.contains("quarantine_warnings (1)")));
-        assert!(errs.iter().any(|e| e.contains("target panicked")));
 
-        let no_end = sample_meta(1, SbiCapMask::BASE);
-        let errs = validate_capture(&no_end, &ValidationPolicy::default()).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("missing @@MBENCH:END")));
+        // Trailing frame after END and duplicate END must be caught.
+        let mut trailing = ok_log.clone();
+        trailing.push_str(&check_line("conformance/extra", CheckStatus::Pass));
+        trailing.push_str(&end_line(EndRecord::default()));
+        let trailing_report = audit_capture("trailing", &trailing);
+        assert!(!trailing_report.protocol_valid);
+        assert!(
+            trailing_report
+                .protocol_errors
+                .iter()
+                .any(|e| e.contains("after END"))
+        );
+        assert!(
+            trailing_report
+                .protocol_errors
+                .iter()
+                .any(|e| e.contains("duplicate @@MBENCH:END"))
+        );
 
-        let mut failed_cases = sample_meta(1, SbiCapMask::BASE);
-        failed_cases.push_str(&check_line(
-            "conformance/base",
-            CheckStatus::Failed(FailReason::AssertionFailed("bad_spec")),
+        // Malformed or truncated @@MBENCH lines must be flagged.
+        let malformed = format!("{}\n@@MBENCH:BOGUS\n", sample_meta(1, SbiCapMask::BASE));
+        let malformed_report = audit_capture("malformed", &malformed);
+        assert!(!malformed_report.protocol_valid);
+        assert!(!malformed_report.completed);
+
+        // Mismatched raw END count must be flagged even when JSON parses cleanly.
+        let mut mismatch = sample_meta(1, SbiCapMask::BASE);
+        mismatch.push_str(&check_line("conformance/base", CheckStatus::Pass));
+        mismatch.push_str(&end_line(EndRecord::default()));
+        let mismatch_report = audit_capture("mismatch", &mismatch);
+        assert!(!mismatch_report.protocol_valid);
+        assert!(
+            mismatch_report
+                .protocol_errors
+                .iter()
+                .any(|e| e.contains("checks_total"))
+        );
+    }
+
+    #[test]
+    fn merged_report_preserves_attempt_errors_and_recovery_markers() {
+        let mut merged_bad = String::from(
+            "# MBENCH_ENV {\"clock_regime\":\"qemu-tcg-non-cycle-accurate\",\"label\":\"fw\",\"smp\":4}\n",
+        );
+        merged_bad.push_str(&sample_meta(4, SbiCapMask::BASE));
+        merged_bad.push_str(&check_line("conformance/base", CheckStatus::Pass));
+        let bad_attempt = AttemptRecord {
+            attempt: 0,
+            resume_after: None,
+            saw_end: true,
+            shutdown: ShutdownStatus::CleanExit,
+            protocol_errors: vec![String::from("line 3: malformed wire frame")],
+            synthesized_failures: Vec::new(),
+        };
+        merged_bad.push_str(&format!(
+            "# MBENCH_ATTEMPT {}\n",
+            serde_json::to_string(&bad_attempt).unwrap()
         ));
-        failed_cases.push_str(&bench_line(
-            "base/get_spec_version",
-            BenchGroup::Base,
-            1,
-            BenchStatus::Failed(FailReason::VerificationMismatch),
-        ));
-        failed_cases.push_str(&end_line(EndRecord {
+        merged_bad.push_str(&end_line(EndRecord {
             checks_total: 1,
-            checks_failed: 1,
+            checks_passed: 1,
             check_assertions_total: 5,
-            check_assertions_failed: 1,
-            benches_total: 1,
-            benches_failed: 1,
+            check_assertions_passed: 5,
             ..EndRecord::default()
         }));
-        let errs = validate_capture(&failed_cases, &ValidationPolicy::default()).unwrap_err();
+
+        let bad_report = audit_capture("merged-bad", &merged_bad);
+        assert_eq!(bad_report.format, CaptureFormat::MergedJsonl);
+        assert!(!bad_report.protocol_valid);
         assert!(
-            errs.iter()
-                .any(|e| e.contains("check 'conformance/base' FAILED"))
-        );
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("benchmark 'base/get_spec_version' (p=1) FAILED"))
+            bad_report
+                .protocol_errors
+                .iter()
+                .any(|e| e.contains("attempt 0: line 3: malformed wire frame"))
         );
 
-        assert!(parse_forbidden_patterns("# only comments\n\n").is_err());
+        let mut merged_recovered = String::from(
+            "# MBENCH_ENV {\"clock_regime\":\"qemu-tcg-non-cycle-accurate\",\"label\":\"fw\",\"smp\":4}\n",
+        );
+        merged_recovered.push_str(&sample_meta(4, SbiCapMask::BASE));
+        merged_recovered.push_str(
+            "@@MBENCH:CHECK {\"id\":\"conformance/time\",\"checks\":0,\"checks_total\":1,\"checks_failed\":1,\"status\":\"FAIL\",\"fail_reason\":\"timeout\",\"synthetic\":true}\n",
+        );
+        let a0 = AttemptRecord {
+            attempt: 0,
+            resume_after: None,
+            saw_end: false,
+            shutdown: ShutdownStatus::TimedOutDuringRun,
+            protocol_errors: Vec::new(),
+            synthesized_failures: vec![String::from("conformance/time")],
+        };
+        merged_recovered.push_str(&format!(
+            "# MBENCH_ATTEMPT {}\n",
+            serde_json::to_string(&a0).unwrap()
+        ));
+        merged_recovered.push_str(&check_line("conformance/base", CheckStatus::Pass));
+        let a1 = AttemptRecord {
+            attempt: 1,
+            resume_after: Some(String::from("conformance/time")),
+            saw_end: true,
+            shutdown: ShutdownStatus::HostTerminatedAfterEnd,
+            protocol_errors: Vec::new(),
+            synthesized_failures: Vec::new(),
+        };
+        merged_recovered.push_str(&format!(
+            "# MBENCH_ATTEMPT {}\n",
+            serde_json::to_string(&a1).unwrap()
+        ));
+        merged_recovered.push_str(&end_line(EndRecord {
+            checks_total: 2,
+            checks_passed: 1,
+            checks_failed: 1,
+            check_assertions_total: 6,
+            check_assertions_passed: 5,
+            check_assertions_failed: 1,
+            ..EndRecord::default()
+        }));
+
+        let rec_report = audit_capture("merged-rec", &merged_recovered);
+        assert!(
+            rec_report.protocol_valid,
+            "{:?}",
+            rec_report.protocol_errors
+        );
+        assert!(rec_report.completed);
+        assert!(rec_report.recovered);
+        assert!(rec_report.checks[0].synthetic);
+        assert!(!rec_report.checks[1].synthetic);
+        assert_eq!(rec_report.attempts.len(), 2);
+        assert_eq!(
+            rec_report.attempts[1].shutdown,
+            ShutdownStatus::HostTerminatedAfterEnd
+        );
     }
 }

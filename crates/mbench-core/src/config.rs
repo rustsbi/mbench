@@ -226,7 +226,11 @@ impl<'a> RunConfig<'a> {
                     _ => {}
                 },
                 "seed" => {
-                    self.seed = parse_seed(value);
+                    self.seed = if value.is_empty() {
+                        None
+                    } else {
+                        parse_seed(value)
+                    };
                 }
                 "filter" => {
                     self.filter = if value.is_empty() { None } else { Some(value) };
@@ -245,9 +249,9 @@ impl<'a> RunConfig<'a> {
                     }
                 }
                 "max_harts" => {
-                    if let Ok(n) = value.parse::<usize>()
-                        && n > 0
-                    {
+                    if value.is_empty() || value == "0" {
+                        self.max_harts = None;
+                    } else if let Ok(n) = value.parse::<usize>() {
                         self.max_harts = Some(n);
                     }
                 }
@@ -307,18 +311,18 @@ mod tests {
     #[test]
     fn parses_bootargs_with_defaults_and_overrides() {
         let cfg = RunConfig::parse_bootargs_with_defaults(
-            "mode=bench profile=quick filter=rfnc/ io=1",
-            "mode=check filter=base/",
+            "mode=bench profile=quick filter=rfnc/ io=1 destructive=1 max_harts=2 seed=0x1234 resume_after=base/a",
+            "mode=check profile=normal order=fixed seed= filter= io=0 destructive=0 max_harts=0 resume_after=",
         );
         assert_eq!(cfg.mode, RunMode::Check);
-        assert_eq!(cfg.profile, Profile::Quick);
-        assert_eq!(cfg.filter, Some("base/"));
-        assert!(cfg.allow_io);
-
-        let cleared =
-            RunConfig::parse_bootargs_with_defaults("filter=rfnc/", "filter= profile=thorough");
-        assert_eq!(cleared.filter, None);
-        assert_eq!(cleared.profile, Profile::Thorough);
+        assert_eq!(cfg.profile, Profile::Normal);
+        assert_eq!(cfg.order, OrderMode::Fixed);
+        assert_eq!(cfg.seed, None);
+        assert_eq!(cfg.filter, None);
+        assert!(!cfg.allow_io);
+        assert!(!cfg.allow_destructive);
+        assert_eq!(cfg.max_harts, None);
+        assert_eq!(cfg.resume_after, None);
 
         let fallback = RunConfig::parse_bootargs_with_defaults("mode=check max_harts=4", "");
         assert_eq!(fallback.mode, RunMode::Check);

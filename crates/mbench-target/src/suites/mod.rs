@@ -54,7 +54,7 @@ pub(crate) fn run_all(platform: &mut Platform) -> ! {
         platform.info().bootargs,
     );
     let mut con = platform.console();
-    let meta = platform.meta_record();
+    let meta = platform.meta_record(cfg);
     let _ = protocol::write_meta_line(&meta, &mut con);
     if let Some(mh) = cfg.max_harts {
         let _ = writeln!(

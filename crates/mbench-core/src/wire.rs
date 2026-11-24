@@ -9,6 +9,10 @@ use crate::{
     record::{BenchGroup, EndRecord, MeasureMode, SbiExtensionId, SkipReason, StartKind},
 };
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Environment metadata header recorded at the top of saved `.jsonl` captures.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EnvLine {
@@ -22,6 +26,26 @@ pub struct EnvLine {
     pub order: Option<OrderMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_harts: Option<usize>,
+}
+
+/// Effective target runtime configuration reported inside `@@MBENCH:META`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EffectiveConfigFrame {
+    pub mode: RunMode,
+    pub profile: Profile,
+    pub order: OrderMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after: Option<String>,
+    #[serde(default)]
+    pub allow_io: bool,
+    #[serde(default)]
+    pub allow_destructive: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_harts: Option<usize>,
 }
@@ -52,6 +76,8 @@ pub struct MetaFrame {
     pub console_backend: String,
     pub pmu_counter_count: usize,
     pub load_addr: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<EffectiveConfigFrame>,
 }
 
 /// Deserialized `@@MBENCH:CAL` payload.
@@ -181,6 +207,8 @@ pub struct CheckFrame {
     pub issues: Vec<CheckIssueFrame>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub synthetic: bool,
 }
 
 /// Deserialized `@@MBENCH:BENCH` payload.
@@ -211,6 +239,8 @@ pub struct BenchFrame {
     pub throughput_ops_per_sec: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub synthetic: bool,
     /// Zero-based index into [`ParsedCapture::cals`] identifying the calibration active when emitted.
     #[serde(skip)]
     pub cal_index: Option<usize>,
@@ -218,6 +248,33 @@ pub struct BenchFrame {
 
 /// Deserialized `@@MBENCH:END` payload.
 pub type EndFrame = EndRecord;
+
+/// Target process shutdown classification observed for one run attempt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShutdownStatus {
+    CleanExit,
+    NonZeroExit { code: i32 },
+    Signaled,
+    TimedOutAfterEnd,
+    HostTerminatedAfterEnd,
+    TimedOutDuringRun,
+    AbortedOnPanic,
+}
+
+/// Host-side audit record appended after each target execution attempt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttemptRecord {
+    pub attempt: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after: Option<String>,
+    pub saw_end: bool,
+    pub shutdown: ShutdownStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synthesized_failures: Vec<String>,
+}
 
 /// Deserialized `@@MBENCH:PANIC` payload.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -238,6 +295,7 @@ pub struct PanicFrame {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WireFrame {
     Env(EnvLine),
+    Attempt(AttemptRecord),
     Meta(MetaFrame),
     Cal(CalFrame),
     Start(StartFrame),
@@ -251,8 +309,10 @@ pub enum WireFrame {
 #[derive(Clone, Debug)]
 pub struct ParsedCapture {
     pub label: String,
+    pub env: Option<EnvLine>,
     pub clock_regime: ClockRegime,
     pub max_harts: Option<usize>,
+    pub attempts: Vec<AttemptRecord>,
     pub meta: Option<MetaFrame>,
     pub cal: Option<CalFrame>,
     pub cals: Vec<CalFrame>,
@@ -271,6 +331,11 @@ pub fn parse_wire_line(raw_line: &str) -> Result<Option<WireFrame>, String> {
         let env: EnvLine =
             serde_json::from_str(json).map_err(|e| format!("invalid MBENCH_ENV frame: {e}"))?;
         return Ok(Some(WireFrame::Env(env)));
+    }
+    if let Some(json) = line.strip_prefix("# MBENCH_ATTEMPT ") {
+        let attempt: AttemptRecord =
+            serde_json::from_str(json).map_err(|e| format!("invalid MBENCH_ATTEMPT frame: {e}"))?;
+        return Ok(Some(WireFrame::Attempt(attempt)));
     }
 
     let Some(pos) = line.find("@@MBENCH:") else {
@@ -327,8 +392,10 @@ pub fn parse_wire_line(raw_line: &str) -> Result<Option<WireFrame>, String> {
 /// Extracts `@@MBENCH:*` records from either saved `.jsonl` captures or noisy raw serial output.
 pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, String> {
     let mut label = default_label.to_string();
+    let mut env_hdr = None;
     let mut clock_regime = ClockRegime::Unknown;
     let mut max_harts = None;
+    let mut attempts: Vec<AttemptRecord> = Vec::new();
     let mut meta = None;
     let mut cal = None;
     let mut cals: Vec<CalFrame> = Vec::new();
@@ -352,12 +419,14 @@ pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, S
                 if env.max_harts.is_some() {
                     max_harts = env.max_harts;
                 }
-                if let Some(lbl) = env.label
+                if let Some(lbl) = &env.label
                     && !lbl.is_empty()
                 {
-                    label = lbl;
+                    label = lbl.clone();
                 }
+                env_hdr = Some(env);
             }
+            WireFrame::Attempt(attempt) => attempts.push(attempt),
             WireFrame::Meta(m) => {
                 meta = Some(m);
                 active_cal_index = None;
@@ -407,14 +476,21 @@ pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, S
         .filter_map(|key| bench_map.remove(&key))
         .collect::<Vec<_>>();
 
-    if meta.is_none() && checks.is_empty() && benches.is_empty() && panic.is_none() {
+    if meta.is_none()
+        && checks.is_empty()
+        && benches.is_empty()
+        && panic.is_none()
+        && attempts.is_empty()
+    {
         return Err(format!("no @@MBENCH frames found in '{default_label}'"));
     }
 
     Ok(ParsedCapture {
         label,
+        env: env_hdr,
         clock_regime,
         max_harts,
+        attempts,
         meta,
         cal,
         cals,
@@ -590,6 +666,13 @@ mod tests {
             console_backend: "dbcn",
             pmu_counter_count: 16,
             load_addr: 0x8020_0000,
+            config: crate::config::RunConfig {
+                mode: RunMode::Bench,
+                profile: Profile::Quick,
+                filter: Some("base/"),
+                allow_io: true,
+                ..Default::default()
+            },
         };
         protocol::write_meta_line(&meta, &mut raw).unwrap();
         protocol::write_cal_line(&CalibrationRecord::default(), &mut raw).unwrap();
@@ -887,5 +970,10 @@ mod tests {
             resumed_cap.benches[1].skip_reason,
             Some(SkipReason::ResumedPast)
         );
+        let parsed_cfg = cap.meta.as_ref().and_then(|m| m.config.as_ref()).unwrap();
+        assert_eq!(parsed_cfg.mode, RunMode::Bench);
+        assert_eq!(parsed_cfg.profile, Profile::Quick);
+        assert_eq!(parsed_cfg.filter.as_deref(), Some("base/"));
+        assert!(parsed_cfg.allow_io);
     }
 }

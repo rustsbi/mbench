@@ -2,7 +2,7 @@
 
 use std::{
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -11,24 +11,22 @@ use clap::{Args, ValueEnum};
 use mbench_core::{
     config::{OrderMode, Profile, RunMode},
     protocol,
-    record::{BenchGroup, EndRecord, SkipReason, StartKind},
-    validate::{ValidationPolicy, validate_capture},
+    record::{BenchGroup, SbiExtensionId, SkipReason, StartKind},
+    validate::{audit_capture, audit_raw_attempt, summarize_records},
     wire::{
-        BenchFrame, BenchStatusTag, CheckFrame, CheckStatusTag, EnvLine, ParsedCapture, StartFrame,
-        WireFrame, parse_capture, parse_wire_line,
+        AttemptRecord, BenchFrame, BenchStatusTag, CheckFrame, CheckStatusTag, EnvLine,
+        ShutdownStatus, StartFrame, WireFrame, parse_capture, parse_wire_line,
     },
 };
 
-use crate::{
-    runner::{
-        QemuVirtRunner, SessionEvent, SessionExit, TargetLaunchConfig, TargetRunner, TargetSession,
-    },
-    validate::PolicyArgs,
+use crate::runner::{
+    QemuVirtRunner, SessionEvent, SessionExit, TargetLaunchConfig, TargetRunner, TargetSession,
 };
 
 const DEFAULT_TARGET: &str = "riscv64imac-unknown-none-elf";
 const MAX_RECOVERY_ATTEMPTS: usize = 8;
 const POST_END_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const POST_END_NO_SRST_GRACE: Duration = Duration::from_secs(1);
 
 /// Top-level execution mode selectable via `--mode`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -159,13 +157,6 @@ pub(crate) struct RunArgs {
     /// Optional path to save the complete raw target serial console log across attempts.
     #[arg(long)]
     pub(crate) raw_log: Option<PathBuf>,
-
-    /// Enforce capture completeness, clean QEMU exit, zero failures, and policy gates.
-    #[arg(long, default_value_t = false)]
-    pub(crate) strict: bool,
-
-    #[command(flatten)]
-    pub(crate) validation: PolicyArgs,
 }
 
 pub(crate) fn execute(args: RunArgs) -> Result<(), String> {
@@ -240,8 +231,51 @@ fn validate_run_args(args: &RunArgs) -> Result<(), String> {
     if let Some(raw_seed) = &args.seed {
         let _ = parse_seed_u64(raw_seed)?;
     }
-    let _ = args.validation.to_policy()?;
+    if let (Some(out_path), Some(raw_log)) = (&args.out, &args.raw_log)
+        && paths_refer_to_same_file(out_path, raw_log)?
+    {
+        return Err(format!(
+            "--out ('{}') and --raw-log ('{}') must not refer to the same file",
+            out_path.display(),
+            raw_log.display()
+        ));
+    }
     Ok(())
+}
+
+fn resolve_comparable_path(path: &Path) -> Result<PathBuf, String> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to resolve current directory: {e}"))?
+            .join(path)
+    };
+    if let Ok(canonical) = fs::canonicalize(&abs) {
+        return Ok(canonical);
+    }
+    if let (Some(parent), Some(file_name)) = (abs.parent(), abs.file_name())
+        && parent.exists()
+    {
+        let canonical_parent = fs::canonicalize(parent)
+            .map_err(|e| format!("failed to canonicalize {}: {e}", parent.display()))?;
+        return Ok(canonical_parent.join(file_name));
+    }
+    let mut cleaned = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = cleaned.pop();
+            }
+            other => cleaned.push(other.as_os_str()),
+        }
+    }
+    Ok(cleaned)
+}
+
+fn paths_refer_to_same_file(a: &Path, b: &Path) -> Result<bool, String> {
+    Ok(resolve_comparable_path(a)? == resolve_comparable_path(b)?)
 }
 
 fn parse_seed_u64(raw: &str) -> Result<u64, String> {
@@ -271,7 +305,6 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
     args: &RunArgs,
     kernel_path: &Path,
 ) -> Result<(), String> {
-    let policy = args.validation.to_policy()?;
     let label = args.name.clone().unwrap_or_else(|| {
         args.bios
             .file_stem()
@@ -283,6 +316,15 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
         .out
         .clone()
         .unwrap_or_else(|| PathBuf::from("results").join(format!("{label}.jsonl")));
+    if let Some(raw_log) = &args.raw_log
+        && paths_refer_to_same_file(&out_path, raw_log)?
+    {
+        return Err(format!(
+            "--out ('{}') and --raw-log ('{}') must not refer to the same file",
+            out_path.display(),
+            raw_log.display()
+        ));
+    }
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -317,15 +359,16 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
             serde_json::to_string(&env_line).map_err(|e| e.to_string())?
         )],
         quarantine_warnings: 0,
-        record_raw: args.raw_log.is_some() || !policy.forbidden_patterns.is_empty(),
+        record_raw: args.raw_log.is_some(),
         raw_lines: Vec::new(),
     };
 
     let mut resume_after: Option<String> = None;
-    let mut final_outcome: Option<AttemptOutcome> = None;
+    let mut completed_loop = false;
 
     for attempt in 0..=MAX_RECOVERY_ATTEMPTS {
-        let bootargs = build_bootargs(args, effective_seed, resume_after.as_deref());
+        let current_resume = resume_after.clone();
+        let bootargs = build_bootargs(args, effective_seed, current_resume.as_deref());
         let launch_cfg = TargetLaunchConfig {
             bios: &args.bios,
             kernel: kernel_path,
@@ -334,24 +377,42 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
             bootargs: &bootargs,
             extra_args: &args.qemu_args,
         };
-        let outcome = run_single_attempt(
+        let outcome = match run_single_attempt(
             runner,
             &launch_cfg,
             Duration::from_secs(args.timeout.max(1)),
             &mut state,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
+                return Err(err);
+            }
+        };
+
+        let protocol_errors = audit_raw_attempt(&outcome.raw_lines, outcome.saw_end);
 
         if outcome.saw_end {
-            append_unclosed_end_failures(&outcome.unclosed_at_end, &mut state)?;
-            final_outcome = Some(outcome);
+            let synthesized = append_unclosed_end_failures(&outcome.unclosed_at_end, &mut state)?;
+            push_attempt_record(
+                &mut state,
+                AttemptRecord {
+                    attempt,
+                    resume_after: current_resume,
+                    saw_end: true,
+                    shutdown: outcome.shutdown.clone(),
+                    protocol_errors,
+                    synthesized_failures: synthesized,
+                },
+            )?;
+            completed_loop = true;
             break;
         }
 
-        let next_resume = if !outcome.stuck_cases.is_empty() {
-            let reason = if outcome.timed_out {
-                "timeout"
-            } else {
-                "crash"
+        let (next_resume, synthesized) = if !outcome.stuck_cases.is_empty() {
+            let reason = match outcome.shutdown {
+                ShutdownStatus::TimedOutDuringRun => "timeout",
+                _ => "crash",
             };
             let resume_id = outcome
                 .stuck_cases
@@ -359,67 +420,137 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
                 .expect("non-empty stuck_cases")
                 .id
                 .clone();
+            let mut synth_ids = Vec::with_capacity(outcome.stuck_cases.len());
             for stuck in &outcome.stuck_cases {
                 eprintln!(
-                    "[mbench-cli] warning: '{}' (p={}) failed ({reason}); synthesizing FAIL (attempt {})",
+                    "[mbench-cli] warning: '{}' (p={}) did not finish ({reason}); synthesizing FAIL (attempt {})",
                     stuck.id,
                     stuck.parallel,
                     attempt + 1
                 );
                 state.frames.push(synthesize_fail_frame(stuck, reason)?);
+                synth_ids.push(stuck.id.clone());
             }
-            resume_id
+            (Some(resume_id), synth_ids)
         } else if let Some(finished_id) = outcome.last_completed_id {
             eprintln!(
-                "[mbench-cli] warning: target exited after '{finished_id}' ({}); resuming (attempt {})",
-                outcome.exit_status,
+                "[mbench-cli] warning: target stopped after '{finished_id}' ({:?}); resuming (attempt {})",
+                outcome.shutdown,
                 attempt + 1
             );
-            finished_id
+            (Some(finished_id), Vec::new())
         } else {
-            write_raw_log(args.raw_log.as_deref(), &state.raw_lines)?;
+            (None, Vec::new())
+        };
+
+        push_attempt_record(
+            &mut state,
+            AttemptRecord {
+                attempt,
+                resume_after: current_resume.clone(),
+                saw_end: false,
+                shutdown: outcome.shutdown.clone(),
+                protocol_errors,
+                synthesized_failures: synthesized,
+            },
+        )?;
+
+        let Some(next_resume_id) = next_resume else {
+            persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
             return Err(format!(
-                "target exited ({}) before emitting @@MBENCH:END and no active case was recorded",
-                outcome.exit_status
+                "target stopped ({:?}) before emitting @@MBENCH:END and no active case was recorded (saved outputs to {})",
+                outcome.shutdown,
+                out_path.display()
             ));
         };
 
-        if resume_after.as_deref() == Some(next_resume.as_str()) {
-            write_raw_log(args.raw_log.as_deref(), &state.raw_lines)?;
+        if current_resume.as_deref() == Some(next_resume_id.as_str()) {
+            persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
             return Err(format!(
-                "recovery stalled on '{next_resume}' across consecutive attempts"
+                "recovery stalled on '{next_resume_id}' across consecutive attempts (saved outputs to {})",
+                out_path.display()
             ));
         }
-        resume_after = Some(next_resume);
+        resume_after = Some(next_resume_id);
     }
 
-    let Some(outcome) = final_outcome else {
-        write_raw_log(args.raw_log.as_deref(), &state.raw_lines)?;
+    if !completed_loop {
+        persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
         return Err(format!(
-            "exceeded maximum recovery attempts ({MAX_RECOVERY_ATTEMPTS})"
+            "exceeded maximum recovery attempts ({MAX_RECOVERY_ATTEMPTS}) (saved outputs to {})",
+            out_path.display()
         ));
-    };
+    }
 
-    let content = finalize_merged_capture(&label, &mut state)?;
+    let content = match finalize_merged_capture(&label, &mut state) {
+        Ok(content) => content,
+        Err(err) => {
+            persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
+            return Err(err);
+        }
+    };
     fs::write(&out_path, &content)
         .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
     eprintln!("[mbench-cli] saved {}", out_path.display());
     write_raw_log(args.raw_log.as_deref(), &state.raw_lines)?;
 
-    if outcome.timed_out || !outcome.exit_status.is_clean_zero() {
-        return Err(format!(
-            "target did not shut down cleanly after @@MBENCH:END (timed_out={}, exit={}); saved capture to {}",
-            outcome.timed_out,
-            outcome.exit_status,
-            out_path.display()
+    let report = audit_capture(&label, &content);
+    let mut errors = report.protocol_errors;
+    if !report.completed {
+        errors.push(String::from("capture did not reach completed END state"));
+    }
+    if let Some(meta) = &report.meta
+        && meta.hart_count != args.smp
+    {
+        errors.push(format!(
+            "reported hart_count={} does not match requested --smp {}",
+            meta.hart_count, args.smp
         ));
     }
-
-    if args.strict {
-        validate_strict_result(&content, &state.raw_lines, &policy, &out_path)?;
+    if let Some(last) = report.attempts.last()
+        && !matches!(
+            last.shutdown,
+            ShutdownStatus::CleanExit | ShutdownStatus::HostTerminatedAfterEnd
+        )
+    {
+        eprintln!(
+            "[mbench-cli] warning: target shutdown status after @@MBENCH:END was {:?}",
+            last.shutdown
+        );
     }
 
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "capture integrity check failed (saved to {}):\n  - {}",
+            out_path.display(),
+            errors.join("\n  - ")
+        ))
+    }
+}
+
+fn push_attempt_record(state: &mut CaptureState, record: AttemptRecord) -> Result<(), String> {
+    let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+    state.frames.push(format!("# MBENCH_ATTEMPT {json}"));
     Ok(())
+}
+
+fn persist_partial_outputs(out_path: &Path, raw_log: Option<&Path>, state: &CaptureState) {
+    if state.frames.len() > 1 {
+        let partial = format!("{}\n", state.frames.join("\n"));
+        if let Err(err) = fs::write(out_path, partial) {
+            eprintln!(
+                "[mbench-cli] warning: failed to save partial capture {}: {err}",
+                out_path.display()
+            );
+        } else {
+            eprintln!("[mbench-cli] saved partial capture {}", out_path.display());
+        }
+    }
+    if let Err(err) = write_raw_log(raw_log, &state.raw_lines) {
+        eprintln!("[mbench-cli] warning: {err}");
+    }
 }
 
 fn write_raw_log(path: Option<&Path>, raw_lines: &[String]) -> Result<(), String> {
@@ -441,50 +572,11 @@ fn write_raw_log(path: Option<&Path>, raw_lines: &[String]) -> Result<(), String
     Ok(())
 }
 
-fn validate_strict_result(
-    merged_jsonl: &str,
-    raw_lines: &[String],
-    policy: &ValidationPolicy,
-    out_path: &Path,
-) -> Result<(), String> {
-    let mut raw_errors = Vec::new();
-    for (idx, line) in raw_lines.iter().enumerate() {
-        for pat in &policy.forbidden_patterns {
-            if !pat.is_empty() && line.contains(pat.as_str()) {
-                raw_errors.push(format!(
-                    "forbidden pattern '{pat}' matched in raw serial output at line {}: {}",
-                    idx + 1,
-                    line.trim()
-                ));
-            }
-        }
-    }
-
-    let merged_policy = ValidationPolicy {
-        require_closed_starts: false,
-        forbidden_patterns: Vec::new(),
-        ..policy.clone()
-    };
-
-    if let Err(mut errs) = validate_capture(merged_jsonl, &merged_policy) {
-        raw_errors.append(&mut errs);
-    }
-
-    if raw_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "strict capture validation failed (capture saved to {}):\n  - {}",
-            out_path.display(),
-            raw_errors.join("\n  - ")
-        ))
-    }
-}
-
 fn append_unclosed_end_failures(
     unclosed: &[StartFrame],
     state: &mut CaptureState,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    let mut ids = Vec::with_capacity(unclosed.len());
     for entry in unclosed {
         eprintln!(
             "[mbench-cli] warning: '{}' (p={}) opened before END without a valid result frame; synthesizing FAIL(protocol_error)",
@@ -493,15 +585,16 @@ fn append_unclosed_end_failures(
         state
             .frames
             .push(synthesize_fail_frame(entry, "protocol_error")?);
+        ids.push(entry.id.clone());
     }
-    Ok(())
+    Ok(ids)
 }
 
 fn finalize_merged_capture(label: &str, state: &mut CaptureState) -> Result<String, String> {
     let body = format!("{}\n", state.frames.join("\n"));
     let parsed = parse_capture(label, &body)
         .map_err(|e| format!("captured output failed wire validation: {e}"))?;
-    let merged_end = compute_merged_end_record(&parsed, state.quarantine_warnings);
+    let merged_end = summarize_records(&parsed.checks, &parsed.benches, state.quarantine_warnings);
     let mut end_line = String::new();
     protocol::write_end_line(&merged_end, &mut end_line)
         .map_err(|e| format!("failed to format END frame: {e}"))?;
@@ -513,40 +606,6 @@ fn finalize_merged_capture(label: &str, state: &mut CaptureState) -> Result<Stri
     Ok(content)
 }
 
-fn compute_merged_end_record(cap: &ParsedCapture, quarantine_warnings: usize) -> EndRecord {
-    let mut end = EndRecord {
-        quarantine_warnings,
-        ..EndRecord::default()
-    };
-    for chk in &cap.checks {
-        end.checks_total = end.checks_total.saturating_add(1);
-        match chk.status {
-            CheckStatusTag::Pass => end.checks_passed += 1,
-            CheckStatusTag::Skipped => end.checks_skipped += 1,
-            CheckStatusTag::Fail => end.checks_failed += 1,
-        }
-        let case_total = chk
-            .checks_total
-            .max(chk.checks.saturating_add(chk.checks_failed));
-        end.check_assertions_total = end.check_assertions_total.saturating_add(case_total);
-        end.check_assertions_passed = end.check_assertions_passed.saturating_add(chk.checks);
-        end.check_assertions_failed = end
-            .check_assertions_failed
-            .saturating_add(chk.checks_failed);
-    }
-    for bench in &cap.benches {
-        end.benches_total = end.benches_total.saturating_add(1);
-        match bench.status {
-            BenchStatusTag::Pass => end.benches_passed += 1,
-            BenchStatusTag::Skipped => end.benches_skipped += 1,
-            BenchStatusTag::HwNative => end.benches_hw_native += 1,
-            BenchStatusTag::DelegatedToS => end.benches_delegated += 1,
-            BenchStatusTag::Fail => end.benches_failed += 1,
-        }
-    }
-    end
-}
-
 struct CaptureState {
     frames: Vec<String>,
     quarantine_warnings: usize,
@@ -555,9 +614,9 @@ struct CaptureState {
 }
 
 struct AttemptOutcome {
+    raw_lines: Vec<String>,
     saw_end: bool,
-    timed_out: bool,
-    exit_status: SessionExit,
+    shutdown: ShutdownStatus,
     stuck_cases: Vec<StartFrame>,
     unclosed_at_end: Vec<StartFrame>,
     last_completed_id: Option<String>,
@@ -576,6 +635,8 @@ struct AttemptTracker {
     active_cases: Vec<StartFrame>,
     unclosed_at_end: Vec<StartFrame>,
     last_completed_id: Option<String>,
+    saw_srst: Option<bool>,
+    saw_panic: bool,
     saw_end: bool,
 }
 
@@ -585,6 +646,8 @@ impl AttemptTracker {
             active_cases: Vec::new(),
             unclosed_at_end: Vec::new(),
             last_completed_id: None,
+            saw_srst: None,
+            saw_panic: false,
             saw_end: false,
         }
     }
@@ -600,7 +663,12 @@ impl AttemptTracker {
                 }
                 LineAction::ArmCaseDeadline
             }
-            Ok(Some(WireFrame::Meta(_) | WireFrame::Cal(_))) => {
+            Ok(Some(WireFrame::Meta(meta))) => {
+                self.saw_srst = Some(meta.extensions.contains(&SbiExtensionId::Srst));
+                push_normalized_wire_line(line, &mut state.frames);
+                LineAction::RefreshPhaseIfIdle
+            }
+            Ok(Some(WireFrame::Cal(_))) => {
                 push_normalized_wire_line(line, &mut state.frames);
                 LineAction::RefreshPhaseIfIdle
             }
@@ -642,33 +710,76 @@ impl AttemptTracker {
                 LineAction::ArmShutdownDeadline
             }
             Ok(Some(WireFrame::Panic(_))) => {
+                self.saw_panic = true;
                 push_normalized_wire_line(line, &mut state.frames);
                 println!("{line}");
                 LineAction::StopSession
             }
-            Ok(Some(WireFrame::Env(_))) => LineAction::Continue,
+            Ok(Some(WireFrame::Env(_) | WireFrame::Attempt(_))) => LineAction::Continue,
             Ok(None) => {
                 println!("{line}");
                 LineAction::Continue
             }
             Err(err) => {
-                eprintln!("[mbench-cli] warning: ignoring malformed wire line: {err}");
+                eprintln!("[mbench-cli] warning: invalid wire line preserved in audit: {err}");
                 println!("{line}");
                 LineAction::Continue
             }
         }
     }
 
-    fn into_outcome(self, timed_out: bool, exit_status: SessionExit) -> AttemptOutcome {
+    fn classify_shutdown(&self, timed_out: bool, exit_status: SessionExit) -> ShutdownStatus {
+        if self.saw_panic && !self.saw_end {
+            return ShutdownStatus::AbortedOnPanic;
+        }
+        if !self.saw_end {
+            if timed_out {
+                return ShutdownStatus::TimedOutDuringRun;
+            }
+            return match exit_status {
+                SessionExit::Exited(Some(0)) => ShutdownStatus::CleanExit,
+                SessionExit::Exited(Some(code)) => ShutdownStatus::NonZeroExit { code },
+                SessionExit::Exited(None) => ShutdownStatus::Signaled,
+                SessionExit::Killed => ShutdownStatus::TimedOutDuringRun,
+            };
+        }
+        if timed_out {
+            return if self.saw_srst == Some(false) {
+                ShutdownStatus::HostTerminatedAfterEnd
+            } else {
+                ShutdownStatus::TimedOutAfterEnd
+            };
+        }
+        match exit_status {
+            SessionExit::Exited(Some(0)) => ShutdownStatus::CleanExit,
+            SessionExit::Exited(Some(code)) => ShutdownStatus::NonZeroExit { code },
+            SessionExit::Exited(None) => ShutdownStatus::Signaled,
+            SessionExit::Killed => {
+                if self.saw_srst == Some(false) {
+                    ShutdownStatus::HostTerminatedAfterEnd
+                } else {
+                    ShutdownStatus::TimedOutAfterEnd
+                }
+            }
+        }
+    }
+
+    fn into_outcome(
+        self,
+        raw_lines: Vec<String>,
+        timed_out: bool,
+        exit_status: SessionExit,
+    ) -> AttemptOutcome {
+        let shutdown = self.classify_shutdown(timed_out, exit_status);
         let stuck_cases = if self.saw_end {
             Vec::new()
         } else {
             self.active_cases
         };
         AttemptOutcome {
+            raw_lines,
             saw_end: self.saw_end,
-            timed_out,
-            exit_status,
+            shutdown,
             stuck_cases,
             unclosed_at_end: self.unclosed_at_end,
             last_completed_id: self.last_completed_id,
@@ -686,6 +797,7 @@ fn run_single_attempt<R: TargetRunner>(
     let mut phase_deadline = Instant::now() + timeout;
     let mut case_deadline: Option<Instant> = None;
     let mut tracker = AttemptTracker::new();
+    let mut attempt_raw_lines = Vec::new();
     let mut timed_out = false;
     let mut stopped_early = false;
 
@@ -702,11 +814,12 @@ fn run_single_attempt<R: TargetRunner>(
             .saturating_duration_since(now)
             .min(Duration::from_millis(200));
 
-        match session.next_event(wait_for)? {
-            Some(SessionEvent::Line(line)) => {
+        match session.next_event(wait_for) {
+            Ok(Some(SessionEvent::Line(line))) => {
                 if state.record_raw {
                     state.raw_lines.push(line.clone());
                 }
+                attempt_raw_lines.push(line.clone());
                 match tracker.process_line(&line, state) {
                     LineAction::Continue => {}
                     LineAction::ArmCaseDeadline => case_deadline = Some(Instant::now() + timeout),
@@ -721,7 +834,12 @@ fn run_single_attempt<R: TargetRunner>(
                     }
                     LineAction::ArmShutdownDeadline => {
                         case_deadline = None;
-                        phase_deadline = Instant::now() + timeout.min(POST_END_SHUTDOWN_TIMEOUT);
+                        let grace = if tracker.saw_srst == Some(false) {
+                            timeout.min(POST_END_NO_SRST_GRACE)
+                        } else {
+                            timeout.min(POST_END_SHUTDOWN_TIMEOUT)
+                        };
+                        phase_deadline = Instant::now() + grace;
                     }
                     LineAction::StopSession => {
                         stopped_early = true;
@@ -730,20 +848,36 @@ fn run_single_attempt<R: TargetRunner>(
                     }
                 }
             }
-            Some(SessionEvent::Eof) => break,
-            None => {}
+            Ok(Some(SessionEvent::Eof)) => break,
+            Ok(None) => {}
+            Err(err) => {
+                let _ = session.terminate_and_wait();
+                return Err(err);
+            }
         }
     }
 
     let exit_status = if stopped_early {
         session.terminate_and_wait()
-    } else if let Some(exit) = session.wait_for_exit(timeout.min(POST_END_SHUTDOWN_TIMEOUT))? {
-        exit
     } else {
-        timed_out = true;
-        session.terminate_and_wait()
+        let exit_grace = if tracker.saw_srst == Some(false) {
+            timeout.min(POST_END_NO_SRST_GRACE)
+        } else {
+            timeout.min(POST_END_SHUTDOWN_TIMEOUT)
+        };
+        match session.wait_for_exit(exit_grace) {
+            Ok(Some(exit)) => exit,
+            Ok(None) => {
+                timed_out = true;
+                session.terminate_and_wait()
+            }
+            Err(err) => {
+                let _ = session.terminate_and_wait();
+                return Err(err);
+            }
+        }
     };
-    Ok(tracker.into_outcome(timed_out, exit_status))
+    Ok(tracker.into_outcome(attempt_raw_lines, timed_out, exit_status))
 }
 
 fn push_normalized_wire_line(raw_line: &str, out: &mut Vec<String>) {
@@ -766,6 +900,7 @@ fn synthesize_fail_frame(started: &StartFrame, reason: &str) -> Result<String, S
                 quirks: 0,
                 issues: Vec::new(),
                 note: None,
+                synthetic: true,
             };
             let json = serde_json::to_string(&frame).map_err(|e| e.to_string())?;
             Ok(format!("@@MBENCH:CHECK {json}"))
@@ -788,6 +923,7 @@ fn synthesize_fail_frame(started: &StartFrame, reason: &str) -> Result<String, S
                 ns: None,
                 throughput_ops_per_sec: None,
                 note: None,
+                synthetic: true,
                 cal_index: None,
             };
             let json = serde_json::to_string(&frame).map_err(|e| e.to_string())?;
@@ -822,31 +958,36 @@ fn infer_bench_group(id: &str) -> BenchGroup {
     }
 }
 
+/// Builds complete bootargs setting every knob explicitly so compiled defaults cannot leak through.
 fn build_bootargs(args: &RunArgs, seed: Option<u64>, resume_after: Option<&str>) -> String {
-    let mut parts = vec![
+    let seed_tok = match seed {
+        Some(seed_val) => format!("seed={seed_val:#x}"),
+        None => String::from("seed="),
+    };
+    let filter_tok = match &args.filter {
+        Some(flt) => format!("filter={flt}"),
+        None => String::from("filter="),
+    };
+    let max_harts_tok = match args.max_harts {
+        Some(mh) => format!("max_harts={mh}"),
+        None => String::from("max_harts=0"),
+    };
+    let resume_tok = match resume_after {
+        Some(id) => format!("resume_after={id}"),
+        None => String::from("resume_after="),
+    };
+    [
         format!("mode={}", args.mode.into_core().as_str()),
         format!("profile={}", args.profile.into_core().as_str()),
         format!("order={}", args.order.into_core().as_str()),
-    ];
-    if let Some(seed_val) = seed {
-        parts.push(format!("seed={seed_val:#x}"));
-    }
-    if let Some(filter) = &args.filter {
-        parts.push(format!("filter={filter}"));
-    }
-    if args.io {
-        parts.push(String::from("io=1"));
-    }
-    if args.destructive {
-        parts.push(String::from("destructive=1"));
-    }
-    if let Some(max_harts) = args.max_harts {
-        parts.push(format!("max_harts={max_harts}"));
-    }
-    if let Some(id) = resume_after {
-        parts.push(format!("resume_after={id}"));
-    }
-    parts.join(" ")
+        seed_tok,
+        filter_tok,
+        format!("io={}", usize::from(args.io)),
+        format!("destructive={}", usize::from(args.destructive)),
+        max_harts_tok,
+        resume_tok,
+    ]
+    .join(" ")
 }
 
 pub(crate) fn build_target_binary() -> Result<PathBuf, String> {
@@ -897,13 +1038,7 @@ fn convert_elf_to_binary(elf: &Path, bin: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        sync::{
-            Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use mbench_core::{config::ClockRegime, protocol::write_cal_line, record::CalibrationRecord};
 
@@ -930,77 +1065,6 @@ mod tests {
         }
     }
 
-    struct FakeAttempt {
-        events: VecDeque<SessionEvent>,
-        natural_exit: Option<SessionExit>,
-    }
-
-    struct FakeRunner {
-        attempts: Mutex<VecDeque<FakeAttempt>>,
-    }
-
-    impl FakeRunner {
-        fn new(attempts: Vec<FakeAttempt>) -> Self {
-            Self {
-                attempts: Mutex::new(attempts.into()),
-            }
-        }
-    }
-
-    struct FakeSession {
-        events: VecDeque<SessionEvent>,
-        natural_exit: Option<SessionExit>,
-        exit: Option<SessionExit>,
-    }
-
-    impl TargetRunner for FakeRunner {
-        type Session = FakeSession;
-
-        fn clock_regime(&self, _cfg: &TargetLaunchConfig<'_>) -> ClockRegime {
-            ClockRegime::QemuTcgNonCycleAccurate
-        }
-
-        fn launch(&self, _cfg: &TargetLaunchConfig<'_>) -> Result<Self::Session, String> {
-            let attempt = self
-                .attempts
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("unexpected extra launch attempt");
-            Ok(FakeSession {
-                events: attempt.events,
-                natural_exit: attempt.natural_exit,
-                exit: None,
-            })
-        }
-    }
-
-    impl TargetSession for FakeSession {
-        fn next_event(&mut self, _timeout: Duration) -> Result<Option<SessionEvent>, String> {
-            Ok(self.events.pop_front())
-        }
-
-        fn wait_for_exit(&mut self, _timeout: Duration) -> Result<Option<SessionExit>, String> {
-            if let Some(exit) = self.exit {
-                return Ok(Some(exit));
-            }
-            if let Some(exit) = self.natural_exit {
-                self.exit = Some(exit);
-                return Ok(Some(exit));
-            }
-            Ok(None)
-        }
-
-        fn terminate_and_wait(&mut self) -> SessionExit {
-            if let Some(exit) = self.exit {
-                return exit;
-            }
-            let exit = self.natural_exit.unwrap_or(SessionExit::Killed);
-            self.exit = Some(exit);
-            exit
-        }
-    }
-
     fn base_test_args(out: Option<PathBuf>) -> RunArgs {
         RunArgs {
             bios: PathBuf::from("fw.bin"),
@@ -1021,17 +1085,18 @@ mod tests {
             qemu: String::from("qemu-system-riscv64"),
             out,
             raw_log: None,
-            strict: false,
-            validation: PolicyArgs::default(),
         }
     }
 
-    const META_4_HARTS: &str = "@@MBENCH:META {\"sbi_spec_version\":33554432,\"impl_id\":4,\"impl_version\":1,\"mvendorid\":0,\"marchid\":0,\"mimpid\":0,\"extensions\":[\"base\",\"time\",\"hsm\"],\"extensions_mask\":19,\"hart_count\":4,\"boot_hart_id\":0,\"timebase_hz\":10000000,\"has_cycle\":true,\"has_instret\":true,\"has_time\":true,\"is_rdtime_emulated\":false,\"is_pmu_gated\":false,\"has_sstc\":true,\"has_h_ext\":true,\"boot_ticks\":1,\"reserved_mem_bytes\":0,\"console_backend\":\"dbcn\",\"pmu_counter_count\":0,\"load_addr\":2149580800}";
-    const END_ONE_PASS: &str = "@@MBENCH:END {\"checks_total\":1,\"checks_passed\":1,\"checks_skipped\":0,\"checks_failed\":0,\"check_assertions_total\":5,\"check_assertions_passed\":5,\"check_assertions_failed\":0,\"benches_total\":0,\"benches_passed\":0,\"benches_skipped\":0,\"benches_hw_native\":0,\"benches_delegated\":0,\"benches_failed\":0,\"quarantine_warnings\":0}";
-
     #[test]
-    fn builds_bootargs_synthesizes_parallel_fails_and_recomputes_merged_end() {
+    fn builds_explicit_bootargs_synthesizes_synthetic_fails_and_merges_end() {
         let mut args = base_test_args(None);
+        let default_bootargs = build_bootargs(&args, None, None);
+        assert_eq!(
+            default_bootargs,
+            "mode=check profile=quick order=fixed seed= filter= io=0 destructive=0 max_harts=0 resume_after="
+        );
+
         args.mode = CliRunMode::Bench;
         args.order = CliOrder::Shuffle;
         args.seed = Some(String::from("0xdeadbeef"));
@@ -1113,7 +1178,10 @@ mod tests {
         let cap = parse_capture("fw", &merged).unwrap();
         assert_eq!(cap.cals.len(), 2);
         assert_eq!(cap.checks.len(), 1);
+        assert!(cap.checks[0].synthetic);
         assert_eq!(cap.benches.len(), 2);
+        assert!(!cap.benches[0].synthetic);
+        assert!(cap.benches[1].synthetic);
         assert_eq!(cap.benches[0].cal_index, Some(0));
         assert_eq!(cap.benches[1].cal_index, Some(1));
         let end = cap.end.unwrap();
@@ -1142,27 +1210,34 @@ mod tests {
         for line in lines {
             let _ = tracker.process_line(line, &mut state);
         }
-        let outcome = tracker.into_outcome(false, SessionExit::Exited(Some(0)));
+        let raw_vec: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
+        let outcome = tracker.into_outcome(raw_vec, false, SessionExit::Exited(Some(0)));
         assert!(outcome.saw_end);
         assert_eq!(outcome.unclosed_at_end.len(), 1);
         assert_eq!(outcome.unclosed_at_end[0].id, "conformance/base");
-        append_unclosed_end_failures(&outcome.unclosed_at_end, &mut state).unwrap();
+        assert!(
+            !audit_raw_attempt(&outcome.raw_lines, outcome.saw_end).is_empty(),
+            "raw attempt audit must preserve unclosed START and invalid JSON errors"
+        );
+        let synth = append_unclosed_end_failures(&outcome.unclosed_at_end, &mut state).unwrap();
+        assert_eq!(synth, vec!["conformance/base"]);
         let merged = finalize_merged_capture("fw", &mut state).unwrap();
         let cap = parse_capture("fw", &merged).unwrap();
         assert_eq!(cap.checks.len(), 1);
+        assert!(cap.checks[0].synthetic);
         assert_eq!(cap.checks[0].status, CheckStatusTag::Fail);
         assert_eq!(cap.checks[0].fail_reason.as_deref(), Some("protocol_error"));
-        let end = cap.end.unwrap();
-        assert_eq!(end.checks_total, 1);
-        assert_eq!(end.checks_failed, 1);
     }
 
     #[test]
-    fn validates_run_args_and_refreshes_phase_on_resumed_past() {
-        let existing_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    fn validates_run_args_and_rejects_colliding_output_paths() {
+        let dir = TestWorkDir::new("args");
+        let bios = dir.0.join("fw.bin");
+        fs::write(&bios, b"fw").unwrap();
+
         let base_args = || {
             let mut a = base_test_args(None);
-            a.bios = existing_file.clone();
+            a.bios = bios.clone();
             a.mode = CliRunMode::All;
             a
         };
@@ -1188,134 +1263,19 @@ mod tests {
         path_name.name = Some(String::from("../escape"));
         assert!(validate_run_args(&path_name).is_err());
 
-        let mut path_name_with_out = base_args();
-        path_name_with_out.name = Some(String::from("group/label"));
-        path_name_with_out.out = Some(PathBuf::from("out.jsonl"));
-        assert!(validate_run_args(&path_name_with_out).is_ok());
-
         let mut missing_kernel = base_args();
-        missing_kernel.kernel = Some(existing_file.with_file_name("missing-kernel.bin"));
+        missing_kernel.kernel = Some(dir.0.join("missing-kernel.bin"));
         assert!(validate_run_args(&missing_kernel).is_err());
 
-        let mut tracker = AttemptTracker::new();
-        let mut state = CaptureState {
-            frames: Vec::new(),
-            quarantine_warnings: 0,
-            record_raw: false,
-            raw_lines: Vec::new(),
-        };
-        let chk_resumed = "@@MBENCH:CHECK {\"id\":\"conformance/base\",\"checks\":0,\"checks_total\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}";
-        assert!(matches!(
-            tracker.process_line(chk_resumed, &mut state),
-            LineAction::RefreshPhaseIfIdle
-        ));
-        let bench_resumed = "@@MBENCH:BENCH {\"id\":\"base/get_spec_version\",\"group\":\"base\",\"parallel\":1,\"unit\":\"call\",\"iters_per_trial\":0,\"trials\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}";
-        assert!(matches!(
-            tracker.process_line(bench_resumed, &mut state),
-            LineAction::RefreshPhaseIfIdle
-        ));
-        assert!(state.frames.is_empty());
-    }
+        let mut colliding = base_args();
+        colliding.out = Some(dir.0.join("sub/../out.log"));
+        colliding.raw_log = Some(dir.0.join("out.log"));
+        let err = validate_run_args(&colliding).unwrap_err();
+        assert!(err.contains("same file"));
 
-    #[test]
-    fn enforces_clean_exit_and_strict_validation_after_saving_outputs() {
-        let dir = TestWorkDir::new("runner");
-        let kernel = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-
-        let pass_events = || {
-            VecDeque::from([
-                SessionEvent::Line(META_4_HARTS.to_string()),
-                SessionEvent::Line(String::from(
-                    "@@MBENCH:START {\"kind\":\"check\",\"id\":\"conformance/base\",\"parallel\":1}",
-                )),
-                SessionEvent::Line(String::from(
-                    "@@MBENCH:CHECK {\"id\":\"conformance/base\",\"checks\":5,\"checks_total\":5,\"checks_failed\":0,\"status\":\"PASS\"}",
-                )),
-                SessionEvent::Line(END_ONE_PASS.to_string()),
-                SessionEvent::Eof,
-            ])
-        };
-
-        // 1. Hang after END must fail even though END arrived, after writing .jsonl.
-        let out_hang = dir.0.join("hang.jsonl");
-        let runner = FakeRunner::new(vec![FakeAttempt {
-            events: pass_events(),
-            natural_exit: None,
-        }]);
-        let args = base_test_args(Some(out_hang.clone()));
-        let err = execute_with_runner(&runner, &args, &kernel).unwrap_err();
-        assert!(err.contains("did not shut down cleanly"));
-        assert!(out_hang.exists());
-
-        // 2. Non-zero exit after END must fail, after writing .jsonl.
-        let out_nonzero = dir.0.join("nonzero.jsonl");
-        let runner = FakeRunner::new(vec![FakeAttempt {
-            events: pass_events(),
-            natural_exit: Some(SessionExit::Exited(Some(2))),
-        }]);
-        let args = base_test_args(Some(out_nonzero.clone()));
-        let err = execute_with_runner(&runner, &args, &kernel).unwrap_err();
-        assert!(err.contains("exit code 2"));
-        assert!(out_nonzero.exists());
-
-        // 3. Recovery followed by clean second boot must fail in --strict mode because earlier case failed.
-        let out_recovered = dir.0.join("recovered.jsonl");
-        let raw_recovered = dir.0.join("recovered.log");
-        let runner = FakeRunner::new(vec![
-            FakeAttempt {
-                events: VecDeque::from([
-                    SessionEvent::Line(META_4_HARTS.to_string()),
-                    SessionEvent::Line(String::from(
-                        "@@MBENCH:START {\"kind\":\"check\",\"id\":\"conformance/time\",\"parallel\":1}",
-                    )),
-                    SessionEvent::Eof,
-                ]),
-                natural_exit: Some(SessionExit::Exited(Some(1))),
-            },
-            FakeAttempt {
-                events: VecDeque::from([
-                    SessionEvent::Line(META_4_HARTS.to_string()),
-                    SessionEvent::Line(String::from(
-                        "@@MBENCH:CHECK {\"id\":\"conformance/time\",\"checks\":0,\"checks_total\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}",
-                    )),
-                    SessionEvent::Line(String::from(
-                        "@@MBENCH:START {\"kind\":\"check\",\"id\":\"conformance/base\",\"parallel\":1}",
-                    )),
-                    SessionEvent::Line(String::from(
-                        "@@MBENCH:CHECK {\"id\":\"conformance/base\",\"checks\":5,\"checks_total\":5,\"checks_failed\":0,\"status\":\"PASS\"}",
-                    )),
-                    SessionEvent::Line(END_ONE_PASS.to_string()),
-                    SessionEvent::Eof,
-                ]),
-                natural_exit: Some(SessionExit::Exited(Some(0))),
-            },
-        ]);
-        let mut args = base_test_args(Some(out_recovered.clone()));
-        args.raw_log = Some(raw_recovered.clone());
-        args.strict = true;
-        args.validation.expect_harts = Some(4);
-        args.validation.require_check_pass = vec![String::from("conformance/base")];
-        let err = execute_with_runner(&runner, &args, &kernel).unwrap_err();
-        assert!(err.contains("conformance/time"));
-        assert!(out_recovered.exists());
-        assert!(raw_recovered.exists());
-
-        // 4. Clean strict pass succeeds and saves both outputs.
-        let out_ok = dir.0.join("ok.jsonl");
-        let raw_ok = dir.0.join("ok.log");
-        let runner = FakeRunner::new(vec![FakeAttempt {
-            events: pass_events(),
-            natural_exit: Some(SessionExit::Exited(Some(0))),
-        }]);
-        let mut args = base_test_args(Some(out_ok.clone()));
-        args.raw_log = Some(raw_ok.clone());
-        args.strict = true;
-        args.validation.expect_harts = Some(4);
-        args.validation.require_ext = vec![String::from("base"), String::from("hsm")];
-        args.validation.require_check_pass = vec![String::from("conformance/base")];
-        args.validation.max_quarantine_warnings = Some(0);
-        execute_with_runner(&runner, &args, &kernel).unwrap();
-        assert!(out_ok.exists());
-        assert!(raw_ok.exists());
+        let mut non_colliding = base_args();
+        non_colliding.out = Some(dir.0.join("out.jsonl"));
+        non_colliding.raw_log = Some(dir.0.join("out.log"));
+        assert!(validate_run_args(&non_colliding).is_ok());
     }
 }

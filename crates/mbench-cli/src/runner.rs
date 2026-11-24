@@ -19,13 +19,6 @@ pub(crate) enum SessionExit {
     Killed,
 }
 
-impl SessionExit {
-    /// Returns `true` when the child exited normally with exit code `0`.
-    pub(crate) const fn is_clean_zero(self) -> bool {
-        matches!(self, Self::Exited(Some(0)))
-    }
-}
-
 impl fmt::Display for SessionExit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

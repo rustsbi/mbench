@@ -27,7 +27,7 @@ enum Command {
     Run(Box<run::RunArgs>),
     /// Compares multiple `.jsonl` results or raw serial capture logs side-by-side.
     Compare(compare::CompareArgs),
-    /// Validates completeness, protocol integrity, and policy gates on a capture or serial log.
+    /// Audits capture protocol integrity and exports structured summary reports.
     Validate(validate::ValidateArgs),
 }
 
