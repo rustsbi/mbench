@@ -4,10 +4,12 @@ pub(crate) mod boot;
 pub(crate) mod console;
 pub(crate) mod counters;
 pub(crate) mod dtb;
+mod guards;
 pub(crate) mod hsm;
 pub(crate) mod icache;
 pub(crate) mod misalign;
 pub(crate) mod mmu;
+pub(crate) mod pmu;
 pub(crate) mod shmem;
 pub(crate) mod smp;
 pub(crate) mod sse;
@@ -15,6 +17,7 @@ pub(crate) mod susp;
 pub(crate) mod timer;
 pub(crate) mod trap;
 
+pub(crate) use guards::{Sv39Guard, WorkerIpiModeGuard};
 use mbench_core::{
     engine::{Clock, CounterSnap, HartCoordinator, ParallelSample, ParallelWorkFn},
     record::{
@@ -38,6 +41,44 @@ use self::{
 };
 use crate::sbi::{self, SbiCaps, SbiError, SbiRet};
 
+/// Delegates `Clock` and `HartTopology` to the platform borrowed by a guard or session wrapper.
+macro_rules! impl_platform_clock_topology {
+    ($ty:ty) => {
+        impl mbench_core::engine::Clock for $ty {
+            fn snap_begin(&self) -> mbench_core::engine::CounterSnap {
+                self.platform.snap_begin()
+            }
+
+            fn snap_end(&self) -> mbench_core::engine::CounterSnap {
+                self.platform.snap_end()
+            }
+
+            fn read_cycles(&self) -> u64 {
+                self.platform.read_cycles()
+            }
+
+            fn read_ticks(&self) -> u64 {
+                self.platform.read_ticks()
+            }
+
+            fn availability(&self) -> mbench_core::record::CounterAvailability {
+                self.platform.availability()
+            }
+
+            fn timebase_hz(&self) -> u64 {
+                self.platform.timebase_hz()
+            }
+        }
+
+        impl mbench_core::record::HartTopology for $ty {
+            fn total_harts(&self) -> usize {
+                self.platform.total_harts()
+            }
+        }
+    };
+}
+pub(crate) use impl_platform_clock_topology;
+
 /// Encapsulated S-mode runtime environment passed to conformance checks and benchmark suites.
 pub(crate) struct Platform {
     pub(in crate::platform) info: HardwareInfo,
@@ -54,203 +95,6 @@ pub(crate) struct Platform {
     pmu_tainted_overflow: bool,
     boot_ticks: u64,
     load_addr: usize,
-}
-
-/// RAII guard activating Sv39 identity mapping across all online harts and restoring `Bare` on finish/drop.
-///
-/// Does not implement `DerefMut<Target = Platform>` to prevent re-entrant `enable_sv39()` calls.
-#[must_use = "Sv39Guard should be explicitly finished to check remote teardown results"]
-pub(crate) struct Sv39Guard<'a> {
-    platform: &'a mut Platform,
-    active: bool,
-}
-
-impl Sv39Guard<'_> {
-    pub(crate) fn sv39_asid(&self) -> usize {
-        self.platform.sv39.asid()
-    }
-
-    pub(crate) fn target_page_addr(&self) -> usize {
-        self.platform.sv39.target_page_addr()
-    }
-
-    pub(crate) fn self_hart_mask(&self) -> (usize, usize) {
-        self.platform.self_hart_mask()
-    }
-
-    pub(in crate::platform) fn cfg(&self) -> Sv39Config {
-        self.platform.sv39
-    }
-
-    pub(in crate::platform) fn read_u64_on_worker(
-        &mut self,
-        slot_idx: usize,
-        addr: usize,
-    ) -> Result<u64, FailReason> {
-        self.platform.harts.read_u64_on_worker(slot_idx, addr)
-    }
-
-    /// Restores `Bare` mode on BSP and all online workers, reporting any remote failure.
-    pub(crate) fn finish(mut self) -> Result<(), FailReason> {
-        let res = self.platform.disable_sv39_all_harts_checked();
-        self.active = false;
-        res
-    }
-}
-
-impl Drop for Sv39Guard<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = self.platform.disable_sv39_all_harts_checked();
-            self.active = false;
-        }
-    }
-}
-
-impl Clock for Sv39Guard<'_> {
-    fn snap_begin(&self) -> CounterSnap {
-        self.platform.snap_begin()
-    }
-
-    fn snap_end(&self) -> CounterSnap {
-        self.platform.snap_end()
-    }
-
-    fn read_cycles(&self) -> u64 {
-        self.platform.read_cycles()
-    }
-
-    fn read_ticks(&self) -> u64 {
-        self.platform.read_ticks()
-    }
-
-    fn availability(&self) -> CounterAvailability {
-        self.platform.availability()
-    }
-
-    fn timebase_hz(&self) -> u64 {
-        self.platform.timebase_hz()
-    }
-}
-
-impl HartTopology for Sv39Guard<'_> {
-    fn total_harts(&self) -> usize {
-        self.platform.total_harts()
-    }
-}
-
-impl HartCoordinator for Sv39Guard<'_> {
-    fn online_harts(&self) -> usize {
-        self.platform.online_harts()
-    }
-
-    fn run_parallel(
-        &mut self,
-        parallel: usize,
-        iters: u64,
-        work_fn: ParallelWorkFn,
-        out_samples: &mut [ParallelSample],
-    ) -> Result<(), FailReason> {
-        self.platform
-            .run_parallel(parallel, iters, work_fn, out_samples)
-    }
-}
-
-/// RAII guard configuring IPI hook modes on selected online worker slots and resetting them on finish/drop.
-#[must_use]
-pub(crate) struct WorkerIpiModeGuard<'a> {
-    platform: &'a mut Platform,
-    end_slot: usize,
-    active: bool,
-}
-
-impl WorkerIpiModeGuard<'_> {
-    pub(crate) fn timebase_hz(&self) -> u64 {
-        self.platform.timebase_hz()
-    }
-
-    pub(crate) fn hart_id(&self, slot_idx: usize) -> usize {
-        self.platform.harts.hart_id(slot_idx)
-    }
-
-    pub(crate) fn wait_until(
-        &self,
-        timeout_ticks: u64,
-        cond: impl FnMut() -> bool,
-    ) -> Result<(), FailReason> {
-        self.platform.wait_until(timeout_ticks, cond)
-    }
-
-    pub(crate) fn install_self_ipi_capture(&self) -> Result<trap::IpiCaptureHookGuard, FailReason> {
-        trap::IpiCaptureHookGuard::install(self.platform.availability())
-    }
-
-    /// Resets configured worker IPI hooks back to [`TrapHookMode::None`].
-    pub(crate) fn finish(mut self) -> Result<(), FailReason> {
-        let res = self.reset_workers();
-        self.active = false;
-        res
-    }
-
-    fn reset_workers(&mut self) -> Result<(), FailReason> {
-        let mut first_err: Option<FailReason> = None;
-        let avail = self.platform.availability();
-        for slot in 1..self.end_slot {
-            if let Err(err) =
-                self.platform
-                    .harts
-                    .set_worker_ipi_mode(slot, TrapHookMode::None, avail, 0)
-                && first_err.is_none()
-            {
-                first_err = Some(err);
-            }
-        }
-        match first_err {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
-    }
-}
-
-impl Drop for WorkerIpiModeGuard<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = self.reset_workers();
-            self.active = false;
-        }
-    }
-}
-
-impl Clock for WorkerIpiModeGuard<'_> {
-    fn snap_begin(&self) -> CounterSnap {
-        self.platform.snap_begin()
-    }
-
-    fn snap_end(&self) -> CounterSnap {
-        self.platform.snap_end()
-    }
-
-    fn read_cycles(&self) -> u64 {
-        self.platform.read_cycles()
-    }
-
-    fn read_ticks(&self) -> u64 {
-        self.platform.read_ticks()
-    }
-
-    fn availability(&self) -> CounterAvailability {
-        self.platform.availability()
-    }
-
-    fn timebase_hz(&self) -> u64 {
-        self.platform.timebase_hz()
-    }
-}
-
-impl HartTopology for WorkerIpiModeGuard<'_> {
-    fn total_harts(&self) -> usize {
-        self.platform.total_harts()
-    }
 }
 
 impl Platform {
@@ -407,11 +251,6 @@ impl Platform {
             return None;
         }
         self.hart_mask_for_slot_range(1, online)
-    }
-
-    /// Returns `(hart_mask, hart_mask_base)` covering all online remote workers (`None` if single-hart).
-    pub(crate) fn all_remote_hart_mask(&self) -> Option<(usize, usize)> {
-        self.workers_hart_mask()
     }
 
     fn hart_mask_for_slot_range(

@@ -7,12 +7,10 @@ use mbench_core::{
     record::{BenchGroup, FailReason, SbiExtensionId, SkipReason},
 };
 
+use super::run_shmem_reregister;
 use crate::{
     mbench_loop,
-    platform::{
-        Platform,
-        shmem::{ShmemAcquire, ShmemOwner},
-    },
+    platform::{Platform, shmem::ShmemOwner},
     sbi::{self, SbiError, fwft::FwftFeatureId},
 };
 
@@ -233,21 +231,7 @@ fn run_fwft_set(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> FinishedBe
 }
 
 fn run_sta_set_shmem(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> FinishedBench {
-    let mut lease = match env.lease_shmem(ShmemOwner::Sta) {
-        Ok(ShmemAcquire::Leased(l)) => l,
-        Ok(ShmemAcquire::Unsupported) => return run.skip(SkipReason::FunctionUnsupported),
-        Ok(ShmemAcquire::TooLarge) => return run.skip(SkipReason::ShmemTooLarge),
-        Err(err) => return run.fail(err),
-    };
-    let pending = run.measure_batched(&mut lease, |l, iters| {
-        let mut errors = 0usize;
-        mbench_loop!(iters, {
-            let ret = l.reregister();
-            errors |= ret.error;
-        });
-        BatchOutcome::from_errors(errors, iters)
-    });
-    pending.finish_with(lease.finish())
+    run_shmem_reregister(env, run, ShmemOwner::Sta)
 }
 
 fn run_nacl_probe(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> FinishedBench {
@@ -267,21 +251,7 @@ fn run_nacl_probe(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> Finished
 }
 
 fn run_nacl_set_shmem(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> FinishedBench {
-    let mut lease = match env.lease_shmem(ShmemOwner::Nacl) {
-        Ok(ShmemAcquire::Leased(l)) => l,
-        Ok(ShmemAcquire::Unsupported) => return run.skip(SkipReason::FunctionUnsupported),
-        Ok(ShmemAcquire::TooLarge) => return run.skip(SkipReason::ShmemTooLarge),
-        Err(err) => return run.fail(err),
-    };
-    let pending = run.measure_batched(&mut lease, |l, iters| {
-        let mut errors = 0usize;
-        mbench_loop!(iters, {
-            let ret = l.reregister();
-            errors |= ret.error;
-        });
-        BatchOutcome::from_errors(errors, iters)
-    });
-    pending.finish_with(lease.finish())
+    run_shmem_reregister(env, run, ShmemOwner::Nacl)
 }
 
 fn run_cppc_probe(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> FinishedBench {

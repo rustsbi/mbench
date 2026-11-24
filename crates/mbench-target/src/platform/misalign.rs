@@ -2,14 +2,9 @@
 
 use core::arch::asm;
 
-use mbench_core::{
-    engine::{Clock, CounterSnap},
-    record::{CounterAvailability, HartTopology},
-};
-
 use crate::{
     mbench_loop,
-    platform::{Platform, boot::SyncUnsafeCell, trap},
+    platform::{Platform, boot::SyncUnsafeCell, impl_platform_clock_topology, trap},
     sbi::SbiCaps,
 };
 
@@ -19,8 +14,72 @@ struct MisalignedBuf([u8; 32]);
 static MISALIGN_BUF: SyncUnsafeCell<MisalignedBuf> = SyncUnsafeCell::new(MisalignedBuf([0; 32]));
 
 macro_rules! unaligned_mem_asm {
-    ($insn:literal, $($ops:tt)*) => {
+    ($insn:expr, $($ops:tt)*) => {
         asm!(".option push", ".option norvc", $insn, ".option pop", $($ops)*)
+    };
+}
+
+macro_rules! load_probe {
+    ($name:ident, $insn:literal, $ty:ty) => {
+        /// Probes one unaligned load at `base + 1`.
+        pub(crate) fn $name(&mut self) -> Result<$ty, trap::TrapInfo> {
+            /// Performs an odd-aligned load into caller storage.
+            ///
+            /// # Safety
+            ///
+            /// `ctx` must point to valid writable `$ty` storage and run inside
+            /// [`trap::try_catch_raw`].
+            unsafe extern "C" fn do_load(ctx: *mut u8) {
+                let out_ptr = ctx.cast::<$ty>();
+                let addr = addr_for(OffsetKind::Odd);
+                let loaded: $ty;
+                // SAFETY: Leaf probe reading from `MISALIGN_BUF + 1` inside `try_catch_raw`.
+                unsafe {
+                    unaligned_mem_asm!(
+                        concat!($insn, " {out}, 0({addr})"),
+                        out = out(reg) loaded,
+                        addr = in(reg) addr,
+                        options(nostack)
+                    );
+                    out_ptr.write(loaded);
+                }
+            }
+            let mut val = 0 as $ty;
+            // SAFETY: `do_load` holds zero `Drop` locals and writes only primitive `$ty`.
+            unsafe { trap::try_catch_raw((&raw mut val).cast::<u8>(), do_load)? };
+            Ok(val)
+        }
+    };
+}
+
+macro_rules! store_probe {
+    ($name:ident, $insn:literal, $ty:ty) => {
+        /// Probes one unaligned store at `base + 1`.
+        pub(crate) fn $name(&mut self, val: $ty) -> Result<(), trap::TrapInfo> {
+            /// Performs an odd-aligned store from caller storage.
+            ///
+            /// # Safety
+            ///
+            /// `ctx` must point to valid readable `$ty` storage and run inside
+            /// [`trap::try_catch_raw`].
+            unsafe extern "C" fn do_store(ctx: *mut u8) {
+                // SAFETY: `ctx` points to caller `$ty`.
+                let v = unsafe { ctx.cast::<$ty>().read() } as usize;
+                let addr = addr_for(OffsetKind::Odd);
+                // SAFETY: Leaf probe storing into `MISALIGN_BUF + 1` inside `try_catch_raw`.
+                unsafe {
+                    unaligned_mem_asm!(
+                        concat!($insn, " {val}, 0({addr})"),
+                        val = in(reg) v,
+                        addr = in(reg) addr,
+                        options(nostack)
+                    );
+                }
+            }
+            let mut copy = val;
+            // SAFETY: `do_store` holds zero `Drop` locals and accesses only `copy` + `MISALIGN_BUF`.
+            unsafe { trap::try_catch_raw((&raw mut copy).cast::<u8>(), do_store) }
+        }
     };
 }
 
@@ -39,6 +98,13 @@ pub(crate) enum OffsetKind {
 }
 
 /// Exclusive BSP handle over the static misalignment buffer and probes.
+///
+/// # Invariants
+///
+/// - Borrows `Platform` mutably, so no other BSP-side probe can alias `MISALIGN_BUF`.
+/// - `MISALIGN_BUF` is only accessed through `base_ptr()`/`addr_for()`; all Rust-side accesses
+///   stay within its 32-byte allocation, and assembly probes are bracketed by `try_catch_raw`.
+#[must_use = "MisalignProbe borrows the platform exclusively for probe operations"]
 pub(crate) struct MisalignProbe<'a> {
     platform: &'a mut Platform,
 }
@@ -58,166 +124,37 @@ impl<'a> MisalignProbe<'a> {
 
     /// Writes an 8-byte pattern starting at `odd_offset` (`base + 1`) surrounded by `0xA5` canaries.
     pub(crate) fn write_odd_pattern(&mut self, pattern: &[u8; 8]) {
-        let raw = MISALIGN_BUF.get().cast::<u8>();
+        let raw = base_ptr();
         for i in 0..32 {
             // SAFETY: `i < 32`, strictly inside static `MISALIGN_BUF`.
             unsafe { core::ptr::write_volatile(raw.add(i), 0xA5) };
         }
-        let base = addr_for(OffsetKind::Odd);
+        let base = base_ptr();
         for (i, &b) in pattern.iter().enumerate() {
             // SAFETY: `1 + i < 9 < 32`, strictly inside static `MISALIGN_BUF`.
-            unsafe { core::ptr::write_volatile((base + i) as *mut u8, b) };
+            unsafe { core::ptr::write_volatile(base.add(1 + i), b) };
         }
     }
 
     /// Reads an 8-byte little-endian value starting at `odd_offset` (`base + 1`).
     pub(crate) fn read_odd_u64_le(&self) -> u64 {
-        let base = addr_for(OffsetKind::Odd);
+        let base = base_ptr();
         let mut bytes = [0u8; 8];
         for (i, slot) in bytes.iter_mut().enumerate() {
             // SAFETY: `1 + i < 9 < 32`, strictly inside static `MISALIGN_BUF`.
-            *slot = unsafe { core::ptr::read_volatile((base + i) as *const u8) };
+            *slot = unsafe { core::ptr::read_volatile(base.add(1 + i)) };
         }
         u64::from_le_bytes(bytes)
     }
 
-    /// Probes one unaligned signed 16-bit load (`lh`) at `base + 1`.
-    pub(crate) fn probe_lh(&mut self) -> Result<isize, trap::TrapInfo> {
-        unsafe extern "C" fn do_load(ctx: *mut u8) {
-            let out_ptr = ctx.cast::<isize>();
-            let addr = addr_for(OffsetKind::Odd);
-            let loaded: isize;
-            // SAFETY: Leaf probe reading from `MISALIGN_BUF + 1` inside `try_catch_raw`.
-            unsafe {
-                unaligned_mem_asm!("lh {out}, 0({addr})", out = out(reg) loaded, addr = in(reg) addr, options(nostack));
-                out_ptr.write(loaded);
-            }
-        }
-        let mut val = 0isize;
-        // SAFETY: `do_load` holds zero `Drop` locals and writes only primitive `isize`.
-        unsafe { trap::try_catch_raw((&raw mut val).cast::<u8>(), do_load)? };
-        Ok(val)
-    }
-
-    /// Probes one unaligned unsigned 16-bit load (`lhu`) at `base + 1`.
-    pub(crate) fn probe_lhu(&mut self) -> Result<usize, trap::TrapInfo> {
-        unsafe extern "C" fn do_load(ctx: *mut u8) {
-            let out_ptr = ctx.cast::<usize>();
-            let addr = addr_for(OffsetKind::Odd);
-            let loaded: usize;
-            // SAFETY: Leaf probe reading from `MISALIGN_BUF + 1` inside `try_catch_raw`.
-            unsafe {
-                unaligned_mem_asm!("lhu {out}, 0({addr})", out = out(reg) loaded, addr = in(reg) addr, options(nostack));
-                out_ptr.write(loaded);
-            }
-        }
-        let mut val = 0usize;
-        // SAFETY: `do_load` holds zero `Drop` locals and writes only primitive `usize`.
-        unsafe { trap::try_catch_raw((&raw mut val).cast::<u8>(), do_load)? };
-        Ok(val)
-    }
-
-    /// Probes one unaligned signed 32-bit load (`lw`) at `base + 1`.
-    pub(crate) fn probe_lw(&mut self) -> Result<isize, trap::TrapInfo> {
-        unsafe extern "C" fn do_load(ctx: *mut u8) {
-            let out_ptr = ctx.cast::<isize>();
-            let addr = addr_for(OffsetKind::Odd);
-            let loaded: isize;
-            // SAFETY: Leaf probe reading from `MISALIGN_BUF + 1` inside `try_catch_raw`.
-            unsafe {
-                unaligned_mem_asm!("lw {out}, 0({addr})", out = out(reg) loaded, addr = in(reg) addr, options(nostack));
-                out_ptr.write(loaded);
-            }
-        }
-        let mut val = 0isize;
-        // SAFETY: `do_load` holds zero `Drop` locals and writes only primitive `isize`.
-        unsafe { trap::try_catch_raw((&raw mut val).cast::<u8>(), do_load)? };
-        Ok(val)
-    }
-
-    /// Probes one unaligned unsigned 32-bit load (`lwu`) at `base + 1`.
-    pub(crate) fn probe_lwu(&mut self) -> Result<usize, trap::TrapInfo> {
-        unsafe extern "C" fn do_load(ctx: *mut u8) {
-            let out_ptr = ctx.cast::<usize>();
-            let addr = addr_for(OffsetKind::Odd);
-            let loaded: usize;
-            // SAFETY: Leaf probe reading from `MISALIGN_BUF + 1` inside `try_catch_raw`.
-            unsafe {
-                unaligned_mem_asm!("lwu {out}, 0({addr})", out = out(reg) loaded, addr = in(reg) addr, options(nostack));
-                out_ptr.write(loaded);
-            }
-        }
-        let mut val = 0usize;
-        // SAFETY: `do_load` holds zero `Drop` locals and writes only primitive `usize`.
-        unsafe { trap::try_catch_raw((&raw mut val).cast::<u8>(), do_load)? };
-        Ok(val)
-    }
-
-    /// Probes one unaligned 64-bit load at `base + 1` via fixed `try_catch_raw`.
-    pub(crate) fn probe_ld_64(&mut self) -> Result<u64, trap::TrapInfo> {
-        unsafe extern "C" fn do_load(ctx: *mut u8) {
-            let out_ptr = ctx.cast::<u64>();
-            let addr = addr_for(OffsetKind::Odd);
-            let loaded: u64;
-            // SAFETY: Leaf probe reading from `MISALIGN_BUF + 1` inside `try_catch_raw`.
-            unsafe {
-                unaligned_mem_asm!("ld {out}, 0({addr})", out = out(reg) loaded, addr = in(reg) addr, options(nostack));
-                out_ptr.write(loaded);
-            }
-        }
-        let mut val = 0u64;
-        // SAFETY: `do_load` holds zero `Drop` locals and writes only primitive `u64`.
-        unsafe { trap::try_catch_raw((&raw mut val).cast::<u8>(), do_load)? };
-        Ok(val)
-    }
-
-    /// Probes one unaligned 16-bit store (`sh`) at `base + 1` via fixed `try_catch_raw`.
-    pub(crate) fn probe_sh(&mut self, val: u16) -> Result<(), trap::TrapInfo> {
-        unsafe extern "C" fn do_store(ctx: *mut u8) {
-            // SAFETY: `ctx` points to caller `u16`.
-            let v = unsafe { ctx.cast::<u16>().read() } as usize;
-            let addr = addr_for(OffsetKind::Odd);
-            // SAFETY: Leaf probe storing into `MISALIGN_BUF + 1` inside `try_catch_raw`.
-            unsafe {
-                unaligned_mem_asm!("sh {val}, 0({addr})", val = in(reg) v, addr = in(reg) addr, options(nostack));
-            }
-        }
-        let mut copy = val;
-        // SAFETY: `do_store` holds zero `Drop` locals and accesses only `copy` + `MISALIGN_BUF`.
-        unsafe { trap::try_catch_raw((&raw mut copy).cast::<u8>(), do_store) }
-    }
-
-    /// Probes one unaligned 32-bit store (`sw`) at `base + 1` via fixed `try_catch_raw`.
-    pub(crate) fn probe_sw(&mut self, val: u32) -> Result<(), trap::TrapInfo> {
-        unsafe extern "C" fn do_store(ctx: *mut u8) {
-            // SAFETY: `ctx` points to caller `u32`.
-            let v = unsafe { ctx.cast::<u32>().read() } as usize;
-            let addr = addr_for(OffsetKind::Odd);
-            // SAFETY: Leaf probe storing into `MISALIGN_BUF + 1` inside `try_catch_raw`.
-            unsafe {
-                unaligned_mem_asm!("sw {val}, 0({addr})", val = in(reg) v, addr = in(reg) addr, options(nostack));
-            }
-        }
-        let mut copy = val;
-        // SAFETY: `do_store` holds zero `Drop` locals and accesses only `copy` + `MISALIGN_BUF`.
-        unsafe { trap::try_catch_raw((&raw mut copy).cast::<u8>(), do_store) }
-    }
-
-    /// Probes one unaligned 64-bit store of `val` at `base + 1` via fixed `try_catch_raw`.
-    pub(crate) fn probe_sd_64(&mut self, val: u64) -> Result<(), trap::TrapInfo> {
-        unsafe extern "C" fn do_store(ctx: *mut u8) {
-            // SAFETY: `ctx` points to valid caller `u64`; target holds zero `Drop` locals.
-            let v = unsafe { ctx.cast::<u64>().read() };
-            let addr = addr_for(OffsetKind::Odd);
-            // SAFETY: Leaf probe storing into `MISALIGN_BUF + 1` inside `try_catch_raw`.
-            unsafe {
-                unaligned_mem_asm!("sd {val}, 0({addr})", val = in(reg) v, addr = in(reg) addr, options(nostack));
-            }
-        }
-        let mut copy = val;
-        // SAFETY: `do_store` holds zero `Drop` locals and accesses only `copy` + `MISALIGN_BUF`.
-        unsafe { trap::try_catch_raw((&raw mut copy).cast::<u8>(), do_store) }
-    }
+    load_probe!(probe_lh, "lh", isize);
+    load_probe!(probe_lhu, "lhu", usize);
+    load_probe!(probe_lw, "lw", isize);
+    load_probe!(probe_lwu, "lwu", usize);
+    load_probe!(probe_ld_64, "ld", u64);
+    store_probe!(probe_sh, "sh", u16);
+    store_probe!(probe_sw, "sw", u32);
+    store_probe!(probe_sd_64, "sd", u64);
 
     /// Reads `len` bytes starting at `base + 1` and verifies adjacent `0xA5` canary bytes stayed intact.
     pub(crate) fn verify_odd_bytes_and_canaries(&self, expected: &[u8]) -> bool {
@@ -294,42 +231,19 @@ pub(crate) fn run_single(op: MisalignOp, offset: OffsetKind) {
     }
 }
 
+fn base_ptr() -> *mut u8 {
+    MISALIGN_BUF.get().cast::<u8>()
+}
+
 fn addr_for(offset: OffsetKind) -> usize {
-    let base = MISALIGN_BUF.get().cast::<u8>() as usize;
+    let base = base_ptr();
+    // CAST: assembly `in(reg)` operands are register-width integers; the pointer value keeps its
+    // provenance for all Rust-side accesses. No integer address is converted back to a Rust pointer.
+    let base = base as usize;
     match offset {
         OffsetKind::Aligned => base,
         OffsetKind::Odd => base + 1,
     }
 }
 
-impl Clock for MisalignProbe<'_> {
-    fn snap_begin(&self) -> CounterSnap {
-        self.platform.snap_begin()
-    }
-
-    fn snap_end(&self) -> CounterSnap {
-        self.platform.snap_end()
-    }
-
-    fn read_cycles(&self) -> u64 {
-        self.platform.read_cycles()
-    }
-
-    fn read_ticks(&self) -> u64 {
-        self.platform.read_ticks()
-    }
-
-    fn availability(&self) -> CounterAvailability {
-        self.platform.availability()
-    }
-
-    fn timebase_hz(&self) -> u64 {
-        self.platform.timebase_hz()
-    }
-}
-
-impl HartTopology for MisalignProbe<'_> {
-    fn total_harts(&self) -> usize {
-        self.platform.total_harts()
-    }
-}
+impl_platform_clock_topology!(MisalignProbe<'_>);

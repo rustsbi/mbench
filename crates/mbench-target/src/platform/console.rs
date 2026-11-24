@@ -1,6 +1,6 @@
 //! Console backend selection (`SBI DBCN -> DTB NS16550A -> SBI Legacy`) outside timed batches.
 
-use core::{fmt, panic::PanicInfo};
+use core::{fmt, marker::PhantomData, panic::PanicInfo};
 
 use mbench_core::{protocol, record::SbiExtensionId};
 
@@ -17,8 +17,11 @@ enum ConsoleKind {
 }
 
 /// Active S-mode console output mechanism selected from verified capabilities.
+///
+/// The UART variant performs volatile MMIO without synchronization and is therefore intentionally
+/// `!Sync`; console writes must come from the single owning BSP context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ConsoleBackend(ConsoleKind);
+pub(crate) struct ConsoleBackend(ConsoleKind, PhantomData<*mut ()>);
 
 impl ConsoleBackend {
     /// Selects the highest-priority working console backend from probed SBI and FDT state.
@@ -27,13 +30,13 @@ impl ConsoleBackend {
             // Probe a zero-byte write against valid RAM to verify DBCN responsiveness.
             let probe = sbi::dbcn::write_slice(&[]);
             if probe.error == 0 {
-                return Self(ConsoleKind::Dbcn);
+                return Self(ConsoleKind::Dbcn, PhantomData);
             }
         }
         if let Some(cfg) = uart16550 {
-            return Self(ConsoleKind::Uart16550(cfg));
+            return Self(ConsoleKind::Uart16550(cfg), PhantomData);
         }
-        Self(ConsoleKind::LegacySbi)
+        Self(ConsoleKind::LegacySbi, PhantomData)
     }
 
     /// Returns the short backend label recorded in `@@MBENCH:META`.
@@ -127,20 +130,25 @@ fn uart16550_putc(cfg: Uart16550Config, byte: u8) {
     if cfg.reg_io_width() == 4 {
         // SAFETY: `cfg` was validated from the FDT NS16550A node with 4-byte MMIO width & alignment.
         unsafe {
-            let lsr = lsr_addr as *const u32;
+            // CAST: FDT MMIO addresses have no Rust allocation provenance; volatile-only access.
+            let lsr = core::ptr::without_provenance::<u32>(lsr_addr);
             while core::ptr::read_volatile(lsr) & u32::from(LSR_TX_IDLE) == 0 {
                 core::hint::spin_loop();
             }
-            core::ptr::write_volatile(tx_addr as *mut u32, u32::from(byte));
+            core::ptr::write_volatile(
+                core::ptr::without_provenance_mut::<u32>(tx_addr),
+                u32::from(byte),
+            );
         }
     } else {
         // SAFETY: `cfg` was validated from the FDT NS16550A node with 1-byte MMIO width.
         unsafe {
-            let lsr = lsr_addr as *const u8;
+            // CAST: FDT MMIO addresses have no Rust allocation provenance; volatile-only access.
+            let lsr = core::ptr::without_provenance::<u8>(lsr_addr);
             while core::ptr::read_volatile(lsr) & LSR_TX_IDLE == 0 {
                 core::hint::spin_loop();
             }
-            core::ptr::write_volatile(tx_addr as *mut u8, byte);
+            core::ptr::write_volatile(core::ptr::without_provenance_mut::<u8>(tx_addr), byte);
         }
     }
 }

@@ -9,13 +9,13 @@ use super::check_case;
 use crate::{
     platform::{
         Platform,
+        pmu::PmuCounterGuard,
         shmem::{ShmemAcquire, ShmemOwner},
     },
     sbi::{
         self, SbiError,
         pmu::{EventInfoEntry, config_flags, start_flags, stop_flags},
     },
-    suites::ext_pmu::PmuCounterGuard,
 };
 
 pub(super) static CASES: &[CheckCase<Platform>] = &[check_case(
@@ -30,12 +30,31 @@ fn conf_pmu(env: &mut Platform) -> CheckOutcome {
     let mut ctx = CheckCtx::new();
     let has_time_ext = env.caps().extensions.contains_ext(SbiExtensionId::Time);
 
+    if let Some(pmu_count) = check_pmu_info(&mut ctx) {
+        check_pmu_firmware(&mut ctx, env, has_time_ext);
+        check_pmu_oob_and_snapshot(&mut ctx, env, pmu_count);
+        check_pmu_event_info(&mut ctx, env);
+    } else {
+        return ctx.finish();
+    }
+
+    let inv_fid = sbi::probe_invalid_fid(SbiExtensionId::Pmu);
+    ctx.expect_sbi_err(
+        sbi::error_code(inv_fid),
+        SbiError::NotSupported.as_code(),
+        "pmu_invalid_fid",
+    );
+
+    ctx.finish()
+}
+
+fn check_pmu_info(ctx: &mut CheckCtx) -> Option<usize> {
     let num = sbi::pmu::num_counters();
     if ctx
         .require(num.error == 0 && num.value > 0, "pmu_num_counters_pos")
         .is_err()
     {
-        return ctx.finish();
+        return None;
     }
     let count = num.value;
 
@@ -95,7 +114,10 @@ fn conf_pmu(env: &mut Platform) -> CheckOutcome {
             "pmu_fw_read_hi_on_hw_rejected",
         );
     }
+    Some(count)
+}
 
+fn check_pmu_firmware(ctx: &mut CheckCtx, env: &mut Platform, has_time_ext: bool) {
     match PmuCounterGuard::try_configure_firmware(env, sbi::pmu::FW_SET_TIMER) {
         Ok(Some(mut guard)) => {
             let idx = guard.idx();
@@ -123,7 +145,7 @@ fn conf_pmu(env: &mut Platform) -> CheckOutcome {
             }
             let r1 = sbi::pmu::counter_fw_read(idx);
             let monotonic =
-                r1.error == 0 && (!has_time_ext && r1.value >= r0.value || r1.value > r0.value);
+                r1.error == 0 && ((!has_time_ext && r1.value >= r0.value) || r1.value > r0.value);
             ctx.expect(monotonic, "pmu_fw_monotonic");
 
             let sp = sbi::pmu::counter_stop(idx, 1, 0);
@@ -219,7 +241,9 @@ fn conf_pmu(env: &mut Platform) -> CheckOutcome {
             ctx.record_fail("pmu_configure_fw_set_timer", err);
         }
     }
+}
 
+fn check_pmu_oob_and_snapshot(ctx: &mut CheckCtx, env: &mut Platform, count: usize) {
     let (oob_cfg, oob_cleanup) = PmuCounterGuard::probe_config_matching_and_cleanup(
         env,
         count,
@@ -287,7 +311,9 @@ fn conf_pmu(env: &mut Platform) -> CheckOutcome {
         }
         Err(err) => ctx.record_fail("pmu_snapshot_lease", err),
     }
+}
 
+fn check_pmu_event_info(ctx: &mut CheckCtx, env: &mut Platform) {
     let mut entries = [EventInfoEntry {
         event_idx: sbi::pmu::HW_CPU_CYCLES as u32,
         output: 0xDEAD_BEEF,
@@ -387,13 +413,4 @@ fn conf_pmu(env: &mut Platform) -> CheckOutcome {
         }
         Err(err) => ctx.record_fail("pmu_event_get_info_probe", err),
     }
-
-    let inv_fid = sbi::probe_invalid_fid(SbiExtensionId::Pmu);
-    ctx.expect_sbi_err(
-        sbi::error_code(inv_fid),
-        SbiError::NotSupported.as_code(),
-        "pmu_invalid_fid",
-    );
-
-    ctx.finish()
 }

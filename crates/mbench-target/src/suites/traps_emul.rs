@@ -13,10 +13,10 @@ use crate::{
     platform::{
         Platform,
         misalign::{self, MisalignOp, MisalignProbe, OffsetKind},
+        pmu::PmuCounterGuard,
         trap,
     },
     sbi,
-    suites::ext_pmu,
 };
 
 /// Declarative implicit trap-and-emulate benchmark suite.
@@ -168,7 +168,7 @@ fn classify_emulation_vs_native(probe: &mut MisalignProbe<'_>, op: MisalignOp) -
             MisalignOp::Store => sbi::pmu::FW_MISALIGNED_STORE,
         };
         let mut pmu_guard =
-            match ext_pmu::PmuCounterGuard::try_configure_firmware(probe.platform_mut(), event) {
+            match PmuCounterGuard::try_configure_firmware(probe.platform_mut(), event) {
                 Ok(g) => g,
                 Err(err) => return Classification::Failed(err),
             };

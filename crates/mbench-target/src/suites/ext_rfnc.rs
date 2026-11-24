@@ -109,7 +109,7 @@ fn run_rfence_case(
     }
     let Some((mask, base)) = (match scope {
         TargetScope::SelfHart => Some(env.self_hart_mask()),
-        TargetScope::AllRemote => env.all_remote_hart_mask(),
+        TargetScope::AllRemote => env.workers_hart_mask(),
     }) else {
         return if env.online_harts() < 2 {
             run.skip(SkipReason::SingleHartOnly)
