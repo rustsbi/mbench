@@ -394,6 +394,7 @@ fn audit_multi_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
     let mut total_quarantine = 0usize;
     let mut last_saw_end = false;
     let mut last_saw_panic = false;
+    let mut last_footer_saw_end: Option<bool> = None;
     let mut check_order = Vec::new();
     let mut check_map = BTreeMap::new();
     let mut bench_order = Vec::new();
@@ -468,11 +469,12 @@ fn audit_multi_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
             &sec.unclosed_at_eof,
             eof_reason,
         );
-        all_attempts.extend(sec.attempts);
         if is_last {
             last_saw_end = sec.end.is_some();
             last_saw_panic = sec.saw_panic;
+            last_footer_saw_end = sec.attempts.last().map(|attempt| attempt.saw_end);
         }
+        all_attempts.extend(sec.attempts);
     }
 
     if !any_frame_seen && protocol_errors.is_empty() {
@@ -482,7 +484,7 @@ fn audit_multi_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
     let checks = finalize_check_order(check_order, &mut check_map);
     let benches = finalize_bench_order(bench_order, &mut bench_map);
     let counts = CaptureCounts::from_end(&summarize_records(&checks, &benches, total_quarantine));
-    let last_attempt_complete = all_attempts.last().is_none_or(|attempt| attempt.saw_end);
+    let last_attempt_complete = last_footer_saw_end.unwrap_or(true);
     let completed = any_frame_seen && last_saw_end && !last_saw_panic && last_attempt_complete;
     let recovered = total_sections > 1;
 
@@ -1448,6 +1450,39 @@ mod tests {
         assert_eq!(loop_res.status, BenchStatusTag::Fail);
         assert_eq!(loop_res.fail_reason.as_deref(), Some("crash"));
         assert!(loop_res.synthetic);
+
+        // If attempt 1 reaches END cleanly without its own # MBENCH_ATTEMPT footer,
+        // completed must still be true rather than inheriting attempt 0's saw_end=false.
+        let att1_footer_prefix = "# MBENCH_ATTEMPT {\"attempt\":1,";
+        let missing_last_footer: String = clean_crash_raw
+            .lines()
+            .filter(|line| !line.starts_with(att1_footer_prefix))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let missing_footer_rep = audit_capture("missing-last-footer", &missing_last_footer);
+        assert!(
+            missing_footer_rep.protocol_valid,
+            "{:?}",
+            missing_footer_rep.protocol_errors
+        );
+        assert!(missing_footer_rep.completed);
+        assert!(missing_footer_rep.recovered);
+        assert_eq!(missing_footer_rep.attempts.len(), 1);
+        assert!(!missing_footer_rep.attempts[0].saw_end);
+        assert_eq!(missing_footer_rep.counts.benches_passed, 1);
+        assert_eq!(missing_footer_rep.counts.benches_failed, 1);
+        assert_eq!(missing_footer_rep.counts.benches_skipped, 0);
+
+        // When the final attempt explicitly records saw_end=false, completed stays false.
+        let mut att1_incomplete = att1;
+        att1_incomplete.saw_end = false;
+        let explicit_incomplete = format!(
+            "{missing_last_footer}# MBENCH_ATTEMPT {}\n",
+            serde_json::to_string(&att1_incomplete).unwrap()
+        );
+        let explicit_incomplete_rep = audit_capture("explicit-incomplete", &explicit_incomplete);
+        assert!(!explicit_incomplete_rep.completed);
 
         // Two META frames inside the same attempt boundary still fail.
         let mut dup_meta_raw = String::from("# MBENCH_RAW_ATTEMPT {\"attempt\":0}\n");
