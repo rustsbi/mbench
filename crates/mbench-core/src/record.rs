@@ -183,6 +183,7 @@ pub struct MetaRecord<'a> {
     pub console_backend: &'a str,
     pub pmu_counter_count: usize,
     pub load_addr: usize,
+    pub config: RunConfig<'a>,
 }
 
 /// Baseline calibration data emitted once before performance benchmark suites begin.

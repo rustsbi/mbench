@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+ctrlc.workspace = true
 mbench-core = { workspace = true, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -686,6 +686,7 @@ mod tests {
             console_backend: "dbcn",
             pmu_counter_count: 16,
             load_addr: 0x8020_0000,
+            config: mbench_core::config::RunConfig::default(),
         };
         write_meta_line(&meta, &mut raw).unwrap();
         write_cal_line(&CalibrationRecord::default(), &mut raw).unwrap();

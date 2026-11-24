@@ -363,7 +363,10 @@ impl Platform {
     }
 
     /// Builds the [`MetaRecord`] emitted at Phase 0.
-    pub(crate) fn meta_record(&self) -> MetaRecord<'_> {
+    pub(crate) fn meta_record<'a>(
+        &'a self,
+        config: mbench_core::config::RunConfig<'a>,
+    ) -> MetaRecord<'a> {
         MetaRecord {
             sbi_spec_version: self.caps.spec_version,
             impl_id: self.caps.impl_id,
@@ -383,6 +386,7 @@ impl Platform {
             console_backend: self.console.name(),
             pmu_counter_count: self.pmu_counter_count,
             load_addr: self.load_addr,
+            config,
         }
     }
 

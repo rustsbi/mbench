@@ -1364,6 +1364,7 @@ mod tests {
             console_backend: "dbcn",
             pmu_counter_count: 16,
             load_addr: 0x8020_0000,
+            config: RunConfig::default(),
         };
         protocol::write_meta_line(&meta, &mut out).unwrap();
         protocol::write_cal_line(&CalibrationRecord::default(), &mut out).unwrap();

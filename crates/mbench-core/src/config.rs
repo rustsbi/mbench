@@ -191,7 +191,19 @@ pub struct RunConfig<'a> {
 impl<'a> RunConfig<'a> {
     /// Parses space-delimited `key=value` parameters from a device-tree `bootargs` string.
     pub fn parse_bootargs(raw: &'a str) -> Self {
+        Self::parse_bootargs_with_defaults("", raw)
+    }
+
+    /// Parses compile-time default parameters followed by runtime `/chosen/bootargs` overrides.
+    pub fn parse_bootargs_with_defaults(defaults: &'a str, overrides: &'a str) -> Self {
         let mut cfg = Self::default();
+        cfg.apply_bootargs(defaults);
+        cfg.apply_bootargs(overrides);
+        cfg
+    }
+
+    /// Applies space-delimited `key=value` parameters onto the current configuration.
+    pub fn apply_bootargs(&mut self, raw: &'a str) {
         for token in raw.trim_matches('\0').split_whitespace() {
             let Some((key, value)) = token.split_once('=') else {
                 continue;
@@ -199,50 +211,53 @@ impl<'a> RunConfig<'a> {
             match key {
                 "mode" => {
                     if let Some(m) = RunMode::parse(value) {
-                        cfg.mode = m;
+                        self.mode = m;
                     }
                 }
                 "profile" => match value {
-                    "quick" => cfg.profile = Profile::Quick,
-                    "normal" => cfg.profile = Profile::Normal,
-                    "thorough" => cfg.profile = Profile::Thorough,
+                    "quick" => self.profile = Profile::Quick,
+                    "normal" => self.profile = Profile::Normal,
+                    "thorough" => self.profile = Profile::Thorough,
                     _ => {}
                 },
                 "order" => match value {
-                    "fixed" => cfg.order = OrderMode::Fixed,
-                    "shuffle" => cfg.order = OrderMode::Shuffle,
+                    "fixed" => self.order = OrderMode::Fixed,
+                    "shuffle" => self.order = OrderMode::Shuffle,
                     _ => {}
                 },
                 "seed" => {
-                    cfg.seed = parse_seed(value);
+                    self.seed = if value.is_empty() {
+                        None
+                    } else {
+                        parse_seed(value)
+                    };
                 }
                 "filter" => {
-                    cfg.filter = if value.is_empty() { None } else { Some(value) };
+                    self.filter = if value.is_empty() { None } else { Some(value) };
                 }
                 "resume_after" => {
-                    cfg.resume_after = if value.is_empty() { None } else { Some(value) };
+                    self.resume_after = if value.is_empty() { None } else { Some(value) };
                 }
                 "io" => {
                     if let Some(flag) = parse_bool_flag(value) {
-                        cfg.allow_io = flag;
+                        self.allow_io = flag;
                     }
                 }
                 "destructive" => {
                     if let Some(flag) = parse_bool_flag(value) {
-                        cfg.allow_destructive = flag;
+                        self.allow_destructive = flag;
                     }
                 }
                 "max_harts" => {
-                    if let Ok(n) = value.parse::<usize>()
-                        && n > 0
-                    {
-                        cfg.max_harts = Some(n);
+                    if value.is_empty() || value == "0" {
+                        self.max_harts = None;
+                    } else if let Ok(n) = value.parse::<usize>() {
+                        self.max_harts = Some(n);
                     }
                 }
                 _ => {}
             }
         }
-        cfg
     }
 }
 
@@ -291,5 +306,26 @@ mod tests {
         assert_eq!(RunConfig::parse_bootargs("seed=42").seed, Some(42));
         assert_eq!(RunConfig::parse_bootargs("seed=bad").seed, None);
         assert_eq!(ClockRegime::default(), ClockRegime::Unknown);
+    }
+
+    #[test]
+    fn parses_bootargs_with_defaults_and_overrides() {
+        let cfg = RunConfig::parse_bootargs_with_defaults(
+            "mode=bench profile=quick filter=rfnc/ io=1 destructive=1 max_harts=2 seed=0x1234 resume_after=base/a",
+            "mode=check profile=normal order=fixed seed= filter= io=0 destructive=0 max_harts=0 resume_after=",
+        );
+        assert_eq!(cfg.mode, RunMode::Check);
+        assert_eq!(cfg.profile, Profile::Normal);
+        assert_eq!(cfg.order, OrderMode::Fixed);
+        assert_eq!(cfg.seed, None);
+        assert_eq!(cfg.filter, None);
+        assert!(!cfg.allow_io);
+        assert!(!cfg.allow_destructive);
+        assert_eq!(cfg.max_harts, None);
+        assert_eq!(cfg.resume_after, None);
+
+        let fallback = RunConfig::parse_bootargs_with_defaults("mode=check max_harts=4", "");
+        assert_eq!(fallback.mode, RunMode::Check);
+        assert_eq!(fallback.max_harts, Some(4));
     }
 }

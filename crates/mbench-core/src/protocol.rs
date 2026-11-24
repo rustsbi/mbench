@@ -55,11 +55,37 @@ pub fn write_meta_line(meta: &MetaRecord<'_>, out: &mut (impl Write + ?Sized)) -
         meta.reserved_mem_bytes,
     )?;
     write_json_str(meta.console_backend, out)?;
-    writeln!(
+    write!(
         out,
-        ",\"pmu_counter_count\":{},\"load_addr\":{}}}",
-        meta.pmu_counter_count, meta.load_addr
-    )
+        ",\"pmu_counter_count\":{},\"load_addr\":{},\"config\":{{\"mode\":\"{}\",\"profile\":\"{}\",\"order\":\"{}\",\"allow_io\":{},\"allow_destructive\":{},\"seed\":",
+        meta.pmu_counter_count,
+        meta.load_addr,
+        meta.config.mode.as_str(),
+        meta.config.profile.as_str(),
+        meta.config.order.as_str(),
+        meta.config.allow_io,
+        meta.config.allow_destructive,
+    )?;
+    match meta.config.seed {
+        Some(seed) => write!(out, "{seed}")?,
+        None => out.write_str("null")?,
+    }
+    out.write_str(",\"filter\":")?;
+    match meta.config.filter {
+        Some(flt) => write_json_str(flt, out)?,
+        None => out.write_str("null")?,
+    }
+    out.write_str(",\"resume_after\":")?;
+    match meta.config.resume_after {
+        Some(res) => write_json_str(res, out)?,
+        None => out.write_str("null")?,
+    }
+    out.write_str(",\"max_harts\":")?;
+    match meta.config.max_harts {
+        Some(mh) => write!(out, "{mh}")?,
+        None => out.write_str("null")?,
+    }
+    writeln!(out, "}}}}")
 }
 
 /// Writes an `@@MBENCH:CAL` JSONL frame to `out`.

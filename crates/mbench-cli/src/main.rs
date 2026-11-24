@@ -5,6 +5,7 @@
 mod compare;
 mod run;
 mod runner;
+mod validate;
 
 use std::process::ExitCode;
 
@@ -23,16 +24,19 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Builds (if needed) and runs `mbench` on QEMU with watchdog & crash recovery.
-    Run(run::RunArgs),
+    Run(Box<run::RunArgs>),
     /// Compares multiple `.jsonl` results or raw serial capture logs side-by-side.
     Compare(compare::CompareArgs),
+    /// Audits capture protocol integrity and exports structured summary reports.
+    Validate(validate::ValidateArgs),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let res = match cli.command {
-        Command::Run(args) => run::execute(args),
+        Command::Run(args) => run::execute(*args),
         Command::Compare(args) => compare::execute(args),
+        Command::Validate(args) => validate::execute(args),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,

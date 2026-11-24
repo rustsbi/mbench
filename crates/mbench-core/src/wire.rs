@@ -9,6 +9,10 @@ use crate::{
     record::{BenchGroup, EndRecord, MeasureMode, SbiExtensionId, SkipReason, StartKind},
 };
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Environment metadata header recorded at the top of saved `.jsonl` captures.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EnvLine {
@@ -22,6 +26,26 @@ pub struct EnvLine {
     pub order: Option<OrderMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_harts: Option<usize>,
+}
+
+/// Effective target runtime configuration reported inside `@@MBENCH:META`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EffectiveConfigFrame {
+    pub mode: RunMode,
+    pub profile: Profile,
+    pub order: OrderMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after: Option<String>,
+    #[serde(default)]
+    pub allow_io: bool,
+    #[serde(default)]
+    pub allow_destructive: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_harts: Option<usize>,
 }
@@ -52,6 +76,8 @@ pub struct MetaFrame {
     pub console_backend: String,
     pub pmu_counter_count: usize,
     pub load_addr: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<EffectiveConfigFrame>,
 }
 
 /// Deserialized `@@MBENCH:CAL` payload.
@@ -181,6 +207,8 @@ pub struct CheckFrame {
     pub issues: Vec<CheckIssueFrame>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub synthetic: bool,
 }
 
 /// Deserialized `@@MBENCH:BENCH` payload.
@@ -211,6 +239,8 @@ pub struct BenchFrame {
     pub throughput_ops_per_sec: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub synthetic: bool,
     /// Zero-based index into [`ParsedCapture::cals`] identifying the calibration active when emitted.
     #[serde(skip)]
     pub cal_index: Option<usize>,
@@ -218,6 +248,42 @@ pub struct BenchFrame {
 
 /// Deserialized `@@MBENCH:END` payload.
 pub type EndFrame = EndRecord;
+
+/// Target process shutdown classification observed for one run attempt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShutdownStatus {
+    CleanExit,
+    NonZeroExit { code: i32 },
+    Signaled,
+    Interrupted,
+    TimedOutAfterEnd,
+    HostTerminatedAfterEnd,
+    TimedOutDuringRun,
+    AbortedOnPanic,
+}
+
+/// Explicit attempt boundary marker written into multi-attempt raw serial logs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RawAttemptStart {
+    pub attempt: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after: Option<String>,
+}
+
+/// Host-side audit record appended after each target execution attempt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttemptRecord {
+    pub attempt: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after: Option<String>,
+    pub saw_end: bool,
+    pub shutdown: ShutdownStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synthesized_failures: Vec<String>,
+}
 
 /// Deserialized `@@MBENCH:PANIC` payload.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -238,6 +304,8 @@ pub struct PanicFrame {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WireFrame {
     Env(EnvLine),
+    Attempt(AttemptRecord),
+    RawAttemptStart(RawAttemptStart),
     Meta(MetaFrame),
     Cal(CalFrame),
     Start(StartFrame),
@@ -251,8 +319,10 @@ pub enum WireFrame {
 #[derive(Clone, Debug)]
 pub struct ParsedCapture {
     pub label: String,
+    pub env: Option<EnvLine>,
     pub clock_regime: ClockRegime,
     pub max_harts: Option<usize>,
+    pub attempts: Vec<AttemptRecord>,
     pub meta: Option<MetaFrame>,
     pub cal: Option<CalFrame>,
     pub cals: Vec<CalFrame>,
@@ -271,6 +341,16 @@ pub fn parse_wire_line(raw_line: &str) -> Result<Option<WireFrame>, String> {
         let env: EnvLine =
             serde_json::from_str(json).map_err(|e| format!("invalid MBENCH_ENV frame: {e}"))?;
         return Ok(Some(WireFrame::Env(env)));
+    }
+    if let Some(json) = line.strip_prefix("# MBENCH_ATTEMPT ") {
+        let attempt: AttemptRecord =
+            serde_json::from_str(json).map_err(|e| format!("invalid MBENCH_ATTEMPT frame: {e}"))?;
+        return Ok(Some(WireFrame::Attempt(attempt)));
+    }
+    if let Some(json) = line.strip_prefix("# MBENCH_RAW_ATTEMPT ") {
+        let boundary: RawAttemptStart = serde_json::from_str(json)
+            .map_err(|e| format!("invalid MBENCH_RAW_ATTEMPT frame: {e}"))?;
+        return Ok(Some(WireFrame::RawAttemptStart(boundary)));
     }
 
     let Some(pos) = line.find("@@MBENCH:") else {
@@ -324,17 +404,108 @@ pub fn parse_wire_line(raw_line: &str) -> Result<Option<WireFrame>, String> {
     }
 }
 
+/// Infers [`BenchGroup`] from a benchmark ID prefix such as `"rfnc/sfence_vma.all"`.
+pub fn infer_bench_group(id: &str) -> BenchGroup {
+    let prefix = id.split_once('/').map_or(id, |(head, _)| head);
+    match prefix {
+        "baseline" => BenchGroup::Baseline,
+        "trap" => BenchGroup::TrapEmul,
+        "base" => BenchGroup::Base,
+        "time" => BenchGroup::Time,
+        "spi" => BenchGroup::Spi,
+        "rfnc" => BenchGroup::Rfnc,
+        "hsm" => BenchGroup::Hsm,
+        "srst" => BenchGroup::Srst,
+        "pmu" => BenchGroup::Pmu,
+        "dbcn" => BenchGroup::Dbcn,
+        "susp" => BenchGroup::Susp,
+        "cppc" => BenchGroup::Cppc,
+        "nacl" => BenchGroup::Nacl,
+        "sta" => BenchGroup::Sta,
+        "sse" => BenchGroup::Sse,
+        "fwft" => BenchGroup::Fwft,
+        "dbtr" => BenchGroup::Dbtr,
+        "mpxy" => BenchGroup::Mpxy,
+        "scale" => BenchGroup::Scale,
+        _ => BenchGroup::Baseline,
+    }
+}
+
+/// Maps a target shutdown classification to the normalized host-synthesized failure reason tag.
+pub const fn shutdown_fail_reason(shutdown: &ShutdownStatus) -> &'static str {
+    match shutdown {
+        ShutdownStatus::TimedOutDuringRun => "timeout",
+        ShutdownStatus::Interrupted => "interrupted",
+        ShutdownStatus::CleanExit
+        | ShutdownStatus::NonZeroExit { .. }
+        | ShutdownStatus::Signaled
+        | ShutdownStatus::TimedOutAfterEnd
+        | ShutdownStatus::HostTerminatedAfterEnd
+        | ShutdownStatus::AbortedOnPanic => "crash",
+    }
+}
+
+/// Builds a synthetic `@@MBENCH:CHECK` failure frame for a started case that did not finish.
+pub fn synthesize_fail_check(id: &str, reason: &str) -> CheckFrame {
+    CheckFrame {
+        id: id.to_string(),
+        checks: 0,
+        checks_total: 1,
+        checks_failed: 1,
+        status: CheckStatusTag::Fail,
+        skip_reason: None,
+        fail_reason: Some(reason.to_string()),
+        quirks: 0,
+        issues: Vec::new(),
+        note: None,
+        synthetic: true,
+    }
+}
+
+/// Builds a synthetic `@@MBENCH:BENCH` failure frame for a started benchmark that did not finish.
+pub fn synthesize_fail_bench(id: &str, parallel: usize, reason: &str) -> BenchFrame {
+    BenchFrame {
+        id: id.to_string(),
+        group: infer_bench_group(id),
+        mode: None,
+        parallel,
+        unit: String::from("op"),
+        iters_per_trial: 0,
+        trials: 0,
+        status: BenchStatusTag::Fail,
+        skip_reason: None,
+        fail_reason: Some(reason.to_string()),
+        cycles: None,
+        instret: None,
+        ticks: None,
+        ns: None,
+        throughput_ops_per_sec: None,
+        note: None,
+        synthetic: true,
+        cal_index: None,
+    }
+}
+
 /// Extracts `@@MBENCH:*` records from either saved `.jsonl` captures or noisy raw serial output.
 pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, String> {
+    use crate::validate::{
+        CaseTracker, finalize_bench_order, finalize_check_order, merge_bench_into,
+        merge_check_into, merge_synthesized_unclosed,
+    };
+
     let mut label = default_label.to_string();
+    let mut env_hdr = None;
     let mut clock_regime = ClockRegime::Unknown;
     let mut max_harts = None;
+    let mut attempts: Vec<AttemptRecord> = Vec::new();
     let mut meta = None;
     let mut cal = None;
     let mut cals: Vec<CalFrame> = Vec::new();
     let mut active_cal_index: Option<usize> = None;
     let mut end = None;
     let mut panic = None;
+    let mut tracker = CaseTracker::new();
+    let mut attempt_saw_panic = false;
 
     let mut check_order: Vec<String> = Vec::new();
     let mut check_map: BTreeMap<String, CheckFrame> = BTreeMap::new();
@@ -352,11 +523,43 @@ pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, S
                 if env.max_harts.is_some() {
                     max_harts = env.max_harts;
                 }
-                if let Some(lbl) = env.label
+                if let Some(lbl) = &env.label
                     && !lbl.is_empty()
                 {
-                    label = lbl;
+                    label = lbl.clone();
                 }
+                env_hdr = Some(env);
+            }
+            WireFrame::Attempt(attempt) => {
+                let unclosed = tracker.drain_all();
+                merge_synthesized_unclosed(
+                    &mut check_order,
+                    &mut check_map,
+                    &mut bench_order,
+                    &mut bench_map,
+                    &unclosed,
+                    shutdown_fail_reason(&attempt.shutdown),
+                );
+                attempts.push(attempt);
+                attempt_saw_panic = false;
+            }
+            WireFrame::RawAttemptStart(_) => {
+                let unclosed = tracker.drain_all();
+                let reason = if attempt_saw_panic {
+                    "crash"
+                } else {
+                    "incomplete"
+                };
+                merge_synthesized_unclosed(
+                    &mut check_order,
+                    &mut check_map,
+                    &mut bench_order,
+                    &mut bench_map,
+                    &unclosed,
+                    reason,
+                );
+                active_cal_index = None;
+                attempt_saw_panic = false;
             }
             WireFrame::Meta(m) => {
                 meta = Some(m);
@@ -370,51 +573,70 @@ pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, S
                 cals.push(c);
                 active_cal_index = Some(idx);
             }
-            WireFrame::Start(_) => {}
+            WireFrame::Start(start) => {
+                let _ = tracker.record_start(start);
+            }
             WireFrame::Check(chk) => {
-                if chk.skip_reason == Some(SkipReason::ResumedPast)
-                    && check_map.contains_key(&chk.id)
-                {
-                    continue;
-                }
-                if !check_map.contains_key(&chk.id) {
-                    check_order.push(chk.id.clone());
-                }
-                check_map.insert(chk.id.clone(), chk);
+                let _ = tracker.close_check(&chk.id);
+                merge_check_into(&mut check_order, &mut check_map, chk);
             }
             WireFrame::Bench(mut b) => {
-                let key = (b.id.clone(), b.parallel);
-                if b.skip_reason == Some(SkipReason::ResumedPast) && bench_map.contains_key(&key) {
-                    continue;
-                }
+                let _ = tracker.close_bench(&b.id, b.parallel);
                 b.cal_index = active_cal_index;
-                if !bench_map.contains_key(&key) {
-                    bench_order.push(key.clone());
-                }
-                bench_map.insert(key, *b);
+                merge_bench_into(&mut bench_order, &mut bench_map, *b);
             }
-            WireFrame::End(e) => end = Some(e),
-            WireFrame::Panic(p) => panic = Some(p),
+            WireFrame::End(e) => {
+                let unclosed = tracker.drain_all();
+                merge_synthesized_unclosed(
+                    &mut check_order,
+                    &mut check_map,
+                    &mut bench_order,
+                    &mut bench_map,
+                    &unclosed,
+                    "protocol_error",
+                );
+                end = Some(e);
+            }
+            WireFrame::Panic(p) => {
+                attempt_saw_panic = true;
+                panic = Some(p);
+            }
         }
     }
 
-    let checks = check_order
-        .into_iter()
-        .filter_map(|id| check_map.remove(&id))
-        .collect::<Vec<_>>();
-    let benches = bench_order
-        .into_iter()
-        .filter_map(|key| bench_map.remove(&key))
-        .collect::<Vec<_>>();
+    let remaining = tracker.drain_all();
+    let eof_reason = if attempt_saw_panic {
+        "crash"
+    } else {
+        "incomplete"
+    };
+    merge_synthesized_unclosed(
+        &mut check_order,
+        &mut check_map,
+        &mut bench_order,
+        &mut bench_map,
+        &remaining,
+        eof_reason,
+    );
 
-    if meta.is_none() && checks.is_empty() && benches.is_empty() && panic.is_none() {
+    let checks = finalize_check_order(check_order, &mut check_map);
+    let benches = finalize_bench_order(bench_order, &mut bench_map);
+
+    if meta.is_none()
+        && checks.is_empty()
+        && benches.is_empty()
+        && panic.is_none()
+        && attempts.is_empty()
+    {
         return Err(format!("no @@MBENCH frames found in '{default_label}'"));
     }
 
     Ok(ParsedCapture {
         label,
+        env: env_hdr,
         clock_regime,
         max_harts,
+        attempts,
         meta,
         cal,
         cals,
@@ -590,6 +812,13 @@ mod tests {
             console_backend: "dbcn",
             pmu_counter_count: 16,
             load_addr: 0x8020_0000,
+            config: crate::config::RunConfig {
+                mode: RunMode::Bench,
+                profile: Profile::Quick,
+                filter: Some("base/"),
+                allow_io: true,
+                ..Default::default()
+            },
         };
         protocol::write_meta_line(&meta, &mut raw).unwrap();
         protocol::write_cal_line(&CalibrationRecord::default(), &mut raw).unwrap();
@@ -887,5 +1116,75 @@ mod tests {
             resumed_cap.benches[1].skip_reason,
             Some(SkipReason::ResumedPast)
         );
+        let parsed_cfg = cap.meta.as_ref().and_then(|m| m.config.as_ref()).unwrap();
+        assert_eq!(parsed_cfg.mode, RunMode::Bench);
+        assert_eq!(parsed_cfg.profile, Profile::Quick);
+        assert_eq!(parsed_cfg.filter.as_deref(), Some("base/"));
+        assert!(parsed_cfg.allow_io);
+
+        let raw_hdr = parse_wire_line(
+            "# MBENCH_RAW_ATTEMPT {\"attempt\":1,\"resume_after\":\"conformance/time\"}",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            raw_hdr,
+            WireFrame::RawAttemptStart(RawAttemptStart {
+                attempt: 1,
+                resume_after: Some(String::from("conformance/time")),
+            })
+        );
+        let inter_att = parse_wire_line(
+            "# MBENCH_ATTEMPT {\"attempt\":0,\"saw_end\":false,\"shutdown\":{\"kind\":\"interrupted\"}}",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            inter_att,
+            WireFrame::Attempt(AttemptRecord {
+                shutdown: ShutdownStatus::Interrupted,
+                ..
+            })
+        ));
+
+        // Unclosed START from an earlier attempt must become a synthetic FAIL in parse_capture
+        // rather than letting ResumedPast in the following attempt downgrade it to SKIPPED.
+        let mut crashed_raw = String::from("# MBENCH_RAW_ATTEMPT {\"attempt\":0}\n");
+        crashed_raw.push_str(
+            "@@MBENCH:META {\"sbi_spec_version\":50331648,\"impl_id\":1,\"impl_version\":1,\"mvendorid\":0,\"marchid\":0,\"mimpid\":0,\"extensions\":[\"base\"],\"extensions_mask\":1,\"hart_count\":1,\"boot_hart_id\":0,\"timebase_hz\":10000000,\"has_cycle\":true,\"has_instret\":true,\"has_time\":true,\"is_rdtime_emulated\":false,\"is_pmu_gated\":false,\"has_sstc\":false,\"has_h_ext\":false,\"boot_ticks\":1,\"reserved_mem_bytes\":0,\"console_backend\":\"dbcn\",\"pmu_counter_count\":0,\"load_addr\":2149580800}\n",
+        );
+        crashed_raw.push_str(
+            "@@MBENCH:START {\"kind\":\"bench\",\"id\":\"baseline/loop\",\"parallel\":1}\n",
+        );
+        crashed_raw.push_str(
+            "# MBENCH_ATTEMPT {\"attempt\":0,\"saw_end\":false,\"shutdown\":{\"kind\":\"signaled\"}}\n",
+        );
+        crashed_raw
+            .push_str("# MBENCH_RAW_ATTEMPT {\"attempt\":1,\"resume_after\":\"baseline/loop\"}\n");
+        crashed_raw.push_str(
+            "@@MBENCH:META {\"sbi_spec_version\":50331648,\"impl_id\":1,\"impl_version\":1,\"mvendorid\":0,\"marchid\":0,\"mimpid\":0,\"extensions\":[\"base\"],\"extensions_mask\":1,\"hart_count\":1,\"boot_hart_id\":0,\"timebase_hz\":10000000,\"has_cycle\":true,\"has_instret\":true,\"has_time\":true,\"is_rdtime_emulated\":false,\"is_pmu_gated\":false,\"has_sstc\":false,\"has_h_ext\":false,\"boot_ticks\":1,\"reserved_mem_bytes\":0,\"console_backend\":\"dbcn\",\"pmu_counter_count\":0,\"load_addr\":2149580800}\n",
+        );
+        crashed_raw.push_str(
+            "@@MBENCH:BENCH {\"id\":\"baseline/loop\",\"group\":\"baseline\",\"parallel\":1,\"unit\":\"op\",\"iters_per_trial\":0,\"trials\":0,\"status\":\"SKIPPED\",\"skip_reason\":\"resumed_past\"}\n",
+        );
+        protocol::write_end_line(
+            &EndRecord {
+                benches_total: 1,
+                benches_skipped: 1,
+                ..EndRecord::default()
+            },
+            &mut crashed_raw,
+        )
+        .unwrap();
+        crashed_raw.push_str(
+            "# MBENCH_ATTEMPT {\"attempt\":1,\"resume_after\":\"baseline/loop\",\"saw_end\":true,\"shutdown\":{\"kind\":\"clean_exit\"}}\n",
+        );
+        let crashed_cap = parse_capture("crash-raw", &crashed_raw).unwrap();
+        assert_eq!(crashed_cap.attempts.len(), 2);
+        assert_eq!(crashed_cap.benches.len(), 1);
+        assert_eq!(crashed_cap.benches[0].id, "baseline/loop");
+        assert_eq!(crashed_cap.benches[0].status, BenchStatusTag::Fail);
+        assert_eq!(crashed_cap.benches[0].fail_reason.as_deref(), Some("crash"));
+        assert!(crashed_cap.benches[0].synthetic);
     }
 }
