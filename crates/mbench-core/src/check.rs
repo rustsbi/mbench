@@ -1,4 +1,4 @@
-//! Functional conformance check runner (`conformance/*`), cleanly decoupled from timing.
+//! Functional conformance checks, independent of performance measurement.
 
 use core::fmt::Write;
 
@@ -14,6 +14,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckMeta {
     pub id: &'static str,
+    /// Capabilities and explicit permissions required before execution.
     pub gate: CaseGate,
 }
 
@@ -35,18 +36,28 @@ impl CheckMeta {
 /// Outcome returned by a functional conformance check routine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckOutcome {
+    /// All executed assertions passed.
     Pass {
+        /// Number of passed assertions in this check.
         checks: u64,
+        /// Number of assertions evaluated, including failures.
         total: u64,
+        /// Retained assertion failures and observations.
         issues: CheckIssues,
         note: Option<&'static str>,
     },
+    /// Execution was skipped for the enclosed reason.
     Skipped(SkipReason),
+    /// One or more assertions or prerequisites failed.
     Failed {
+        /// Number of passed assertions in this check.
         checks: u64,
+        /// Number of assertions evaluated, including failures.
         total: u64,
         failed: u64,
+        /// First retained normative failure, used as the case failure reason.
         primary: FailReason,
+        /// Retained assertion failures and observations.
         issues: CheckIssues,
         note: Option<&'static str>,
     },
@@ -54,7 +65,9 @@ pub enum CheckOutcome {
 
 /// Declarative functional conformance check case descriptor.
 pub struct CheckCase<Env> {
+    /// Static metadata controlling case gating.
     pub meta: CheckMeta,
+    /// Conformance callback invoked after its gates pass.
     pub run: fn(&mut Env) -> CheckOutcome,
 }
 
@@ -69,6 +82,7 @@ impl<Env> Copy for CheckCase<Env> {}
 /// Logical group of conformance cases registered together while executed independently.
 pub struct CheckGroup<'a, Env: 'a> {
     pub name: &'static str,
+    /// Cases executed independently in registration order.
     pub cases: &'a [CheckCase<Env>],
 }
 
@@ -95,6 +109,18 @@ pub struct CheckCtx {
 }
 
 impl CheckCtx {
+    fn record_assertion(&mut self, failure: Option<CheckIssue>) -> bool {
+        self.total += 1;
+        if let Some(issue) = failure {
+            self.failed += 1;
+            self.issues.push(issue);
+            false
+        } else {
+            self.passed += 1;
+            true
+        }
+    }
+
     /// Creates an empty conformance context.
     pub const fn new() -> Self {
         Self {
@@ -108,19 +134,11 @@ impl CheckCtx {
 
     /// Evaluates one normative assertion without short-circuiting the remaining checks.
     pub fn expect(&mut self, cond: bool, label: &'static str) -> bool {
-        self.total += 1;
-        if cond {
-            self.passed += 1;
-            true
-        } else {
-            self.failed += 1;
-            self.issues.push(CheckIssue {
-                label,
-                class: IssueClass::SpecViolation,
-                reason: FailReason::AssertionFailed(label),
-            });
-            false
-        }
+        self.record_assertion((!cond).then_some(CheckIssue {
+            label,
+            class: IssueClass::SpecViolation,
+            reason: FailReason::AssertionFailed(label),
+        }))
     }
 
     /// Evaluates a normative assertion annotated with a known firmware quirk (still fails if false).
@@ -130,36 +148,20 @@ impl CheckCtx {
         label: &'static str,
         quirk: &'static str,
     ) -> bool {
-        self.total += 1;
-        if cond {
-            self.passed += 1;
-            true
-        } else {
-            self.failed += 1;
-            self.issues.push(CheckIssue {
-                label,
-                class: IssueClass::SpecViolationWithQuirk(quirk),
-                reason: FailReason::AssertionFailed(label),
-            });
-            false
-        }
+        self.record_assertion((!cond).then_some(CheckIssue {
+            label,
+            class: IssueClass::SpecViolationWithQuirk(quirk),
+            reason: FailReason::AssertionFailed(label),
+        }))
     }
 
     /// Asserts that raw SBI error code `actual` equals `expected` without short-circuiting.
     pub fn expect_sbi_err(&mut self, actual: isize, expected: isize, label: &'static str) -> bool {
-        self.total += 1;
-        if actual == expected {
-            self.passed += 1;
-            true
-        } else {
-            self.failed += 1;
-            self.issues.push(CheckIssue {
-                label,
-                class: IssueClass::SpecViolation,
-                reason: FailReason::UnexpectedSbiError(actual),
-            });
-            false
-        }
+        self.record_assertion((actual != expected).then_some(CheckIssue {
+            label,
+            class: IssueClass::SpecViolation,
+            reason: FailReason::UnexpectedSbiError(actual),
+        }))
     }
 
     /// Asserts that raw SBI error code `actual` belongs to `allowed` without short-circuiting.
@@ -169,19 +171,11 @@ impl CheckCtx {
         allowed: &[isize],
         label: &'static str,
     ) -> bool {
-        self.total += 1;
-        if allowed.contains(&actual) {
-            self.passed += 1;
-            true
-        } else {
-            self.failed += 1;
-            self.issues.push(CheckIssue {
-                label,
-                class: IssueClass::SpecViolation,
-                reason: FailReason::UnexpectedSbiError(actual),
-            });
-            false
-        }
+        self.record_assertion((!allowed.contains(&actual)).then_some(CheckIssue {
+            label,
+            class: IssueClass::SpecViolation,
+            reason: FailReason::UnexpectedSbiError(actual),
+        }))
     }
 
     /// Evaluates an error expectation where one specific error code indicates a known firmware quirk.
@@ -193,27 +187,23 @@ impl CheckCtx {
         quirk: &'static str,
         label: &'static str,
     ) -> bool {
-        self.total += 1;
-        if actual == expected {
-            self.passed += 1;
-            true
+        let class = if actual == quirk_code {
+            IssueClass::SpecViolationWithQuirk(quirk)
         } else {
-            self.failed += 1;
-            let class = if actual == quirk_code {
-                IssueClass::SpecViolationWithQuirk(quirk)
-            } else {
-                IssueClass::SpecViolation
-            };
-            self.issues.push(CheckIssue {
-                label,
-                class,
-                reason: FailReason::UnexpectedSbiError(actual),
-            });
-            false
-        }
+            IssueClass::SpecViolation
+        };
+        self.record_assertion((actual != expected).then_some(CheckIssue {
+            label,
+            class,
+            reason: FailReason::UnexpectedSbiError(actual),
+        }))
     }
 
     /// Enforces a prerequisite needed for safe execution of subsequent checks; aborts only if false.
+    ///
+    /// # Errors
+    ///
+    /// Records a failed assertion and returns `RequireFailed` when `cond` is false.
     pub fn require(&mut self, cond: bool, label: &'static str) -> Result<(), RequireFailed> {
         if self.expect(cond, label) {
             Ok(())
@@ -223,6 +213,11 @@ impl CheckCtx {
     }
 
     /// Enforces an arbitrary fallible prerequisite; aborts only if `res` is `Err`, preserving reason.
+    ///
+    /// # Errors
+    ///
+    /// Records the supplied failure and returns `RequireFailed` when `res` is an error.
+    /// A successful prerequisite does not increment assertion counts.
     pub fn require_ok(
         &mut self,
         res: Result<(), FailReason>,
@@ -239,19 +234,16 @@ impl CheckCtx {
 
     /// Records one externally verified assertion toward passed and total counts.
     pub fn record_pass(&mut self) {
-        self.total += 1;
-        self.passed += 1;
+        self.record_assertion(None);
     }
 
     /// Records one failed assertion with an explicit structured [`FailReason`].
     pub fn record_fail(&mut self, label: &'static str, reason: FailReason) {
-        self.total += 1;
-        self.failed += 1;
-        self.issues.push(CheckIssue {
+        self.record_assertion(Some(CheckIssue {
             label,
             class: IssueClass::SpecViolation,
             reason,
-        });
+        }));
     }
 
     /// Records one quirk-annotated failure with an explicit [`FailReason`].
@@ -261,13 +253,11 @@ impl CheckCtx {
         reason: FailReason,
         quirk: &'static str,
     ) {
-        self.total += 1;
-        self.failed += 1;
-        self.issues.push(CheckIssue {
+        self.record_assertion(Some(CheckIssue {
             label,
             class: IssueClass::SpecViolationWithQuirk(quirk),
             reason,
-        });
+        }));
     }
 
     /// Records a structured observation or issue; failures still update failure tallies.
@@ -282,15 +272,16 @@ impl CheckCtx {
         class: IssueClass,
         reason: FailReason,
     ) {
-        if class.is_failure() {
-            self.total += 1;
-            self.failed += 1;
-        }
-        self.issues.push(CheckIssue {
+        let issue = CheckIssue {
             label,
             class,
             reason,
-        });
+        };
+        if class.is_failure() {
+            self.record_assertion(Some(issue));
+        } else {
+            self.issues.push(issue);
+        }
     }
 
     /// Attaches an optional human-readable note emitted on the `@@MBENCH:CHECK` frame.
@@ -511,120 +502,66 @@ fn emit_check_result(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(feature = "std"))]
-    extern crate std;
-
-    #[cfg(not(feature = "std"))]
-    use std::string::String;
-
-    use super::*;
+    use super::{CheckCtx, CheckOutcome};
     use crate::{
         config::RunConfig,
-        record::{MAX_CHECK_ISSUES, SbiCapMask},
+        record::{
+            CaseFlags, CaseGate, FailReason, IssueClass, MAX_CHECK_ISSUES, RunState, SbiCapMask,
+            SbiExtensionId, SkipReason,
+        },
     };
 
-    struct DummyTopo;
-
-    impl HartTopology for DummyTopo {
-        fn total_harts(&self) -> usize {
-            1
+    #[test]
+    fn counts_assertions_and_preserves_prerequisite_semantics() {
+        let mut ctx = CheckCtx::new();
+        assert!(ctx.expect(true, "first_ok"));
+        assert!(!ctx.expect(false, "bad_ret"));
+        assert!(!ctx.expect_with_quirk(false, "quirk_ret", "opensbi-quirk"));
+        assert!(ctx.require_ok(Ok(()), "ready").is_ok());
+        ctx.observe("permitted", IssueClass::PermittedBehavior);
+        assert!(ctx.require(false, "precond_missing").is_err());
+        match ctx.finish() {
+            CheckOutcome::Failed {
+                checks,
+                total,
+                failed,
+                issues,
+                primary,
+                ..
+            } => {
+                assert_eq!((checks, total, failed), (1, 4, 3));
+                assert_eq!(issues.quirk_count(), 1);
+                assert_eq!(primary, FailReason::AssertionFailed("bad_ret"));
+            }
+            other => panic!("expected Failed outcome, got {other:?}"),
         }
-    }
-
-    fn ok_check(_env: &mut DummyTopo) -> CheckOutcome {
         let mut ctx = CheckCtx::new();
-        ctx.expect(true, "trivial");
-        ctx.record_pass();
-        ctx.finish()
-    }
-
-    fn bad_check_continues(_env: &mut DummyTopo) -> CheckOutcome {
-        let mut ctx = CheckCtx::new();
-        ctx.expect(true, "first_ok");
-        ctx.expect(false, "bad_ret");
-        ctx.expect_with_quirk(false, "quirk_ret", "opensbi-quirk");
-        ctx.expect(true, "last_ok");
-        ctx.finish()
-    }
-
-    fn aborted_check(_env: &mut DummyTopo) -> CheckOutcome {
-        let mut ctx = CheckCtx::new();
-        ctx.expect(true, "pre_ok");
-        if ctx.require(false, "precond_missing").is_err() {
-            return ctx.finish();
-        }
-        ctx.expect(true, "unreachable");
-        ctx.finish()
+        ctx.observe("unsupported", IssueClass::Unsupported);
+        assert_eq!(
+            ctx.finish_or_skip(SkipReason::FunctionUnsupported),
+            CheckOutcome::Skipped(SkipReason::FunctionUnsupported)
+        );
     }
 
     #[test]
-    fn executes_groups_aggregates_issues_and_enforces_require_and_flags() {
-        let group_a = CheckGroup {
-            name: "a",
-            cases: &[
-                CheckCase {
-                    meta: CheckMeta::new("conformance/base", None, 1, CaseFlags::empty()),
-                    run: ok_check,
-                },
-                CheckCase {
-                    meta: CheckMeta::new(
-                        "conformance/sse",
-                        Some(SbiExtensionId::Sse),
-                        1,
-                        CaseFlags::empty(),
-                    ),
-                    run: ok_check,
-                },
-                CheckCase {
-                    meta: CheckMeta::new("conformance/susp", None, 1, CaseFlags::DESTRUCTIVE),
-                    run: ok_check,
-                },
-            ],
-        };
-        let group_b = CheckGroup {
-            name: "b",
-            cases: &[
-                CheckCase {
-                    meta: CheckMeta::new("conformance/multi_fail", None, 1, CaseFlags::empty()),
-                    run: bad_check_continues,
-                },
-                CheckCase {
-                    meta: CheckMeta::new("conformance/aborted", None, 1, CaseFlags::empty()),
-                    run: aborted_check,
-                },
-            ],
-        };
-
-        let mut env = DummyTopo;
+    fn common_gates_preserve_filter_capability_and_safety_order() {
         let mut state = RunState::new(RunConfig::default(), SbiCapMask::BASE);
-        let mut out = String::new();
-        let mut q_calls = 0usize;
-        execute_check_groups(&[group_a, group_b], &mut env, &mut state, &mut out, |_| {
-            q_calls += 1;
-            0
-        });
-
-        assert_eq!(state.summary.checks_total, 5);
-        assert_eq!(state.summary.checks_passed, 1);
-        assert_eq!(state.summary.checks_skipped, 2);
-        assert_eq!(state.summary.checks_failed, 2);
-        // 2 ok + (2 passed, 2 failed) + (1 passed, 1 failed) => total=8, passed=5, failed=3
-        assert_eq!(state.summary.check_assertions_total, 8);
-        assert_eq!(state.summary.check_assertions_passed, 5);
-        assert_eq!(state.summary.check_assertions_failed, 3);
-        assert_eq!(q_calls, 3);
-        assert!(out.contains(
-            "\"id\":\"conformance/base\",\"checks\":2,\"checks_total\":2,\"checks_failed\":0,\"status\":\"PASS\""
-        ));
-        assert!(out.contains("\"skip_reason\":\"extension_unsupported\""));
-        assert!(out.contains("\"skip_reason\":\"requires_destructive_flag\""));
-        assert!(
-            out.contains("\"checks\":2,\"checks_total\":4,\"checks_failed\":2,\"status\":\"FAIL\"")
+        assert_eq!(
+            state.check_common_gates("base", CaseGate::new(None, 1, CaseFlags::empty()), 1),
+            None
         );
-        assert!(out.contains("\"quirks\":1"));
-        assert!(out.contains("\"quirk\":\"opensbi-quirk\""));
-        assert!(out.contains("\"fail_reason\":\"assert:precond_missing\""));
-        assert!(!out.contains("unreachable"));
+        assert_eq!(
+            state.check_common_gates(
+                "sse",
+                CaseGate::new(Some(SbiExtensionId::Sse), 1, CaseFlags::empty()),
+                1
+            ),
+            Some(SkipReason::ExtensionUnsupported)
+        );
+        assert_eq!(
+            state.check_common_gates("susp", CaseGate::new(None, 1, CaseFlags::DESTRUCTIVE), 1),
+            Some(SkipReason::RequiresDestructiveFlag)
+        );
     }
 
     #[test]

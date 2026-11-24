@@ -9,8 +9,11 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
 pub enum RunMode {
     #[default]
+    /// Execute both conformance checks and benchmarks.
     All,
+    /// Execute conformance checks only.
     Check,
+    /// Execute benchmarks only.
     Bench,
 }
 
@@ -51,9 +54,13 @@ impl RunMode {
 #[cfg_attr(feature = "std", serde(rename_all = "kebab-case"))]
 pub enum ClockRegime {
     #[default]
+    /// Timing regime was not recorded.
     Unknown,
+    /// Hardware cycle timing.
     HwCycle,
+    /// QEMU instruction-count timing.
     QemuIcount,
+    /// QEMU TCG timing without cycle accuracy.
     QemuTcgNonCycleAccurate,
 }
 
@@ -74,9 +81,12 @@ impl ClockRegime {
 #[cfg_attr(feature = "std", derive(Deserialize, Serialize))]
 #[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
 pub enum Profile {
+    /// Short measurement profile with five trials.
     Quick,
     #[default]
+    /// Default measurement profile with eleven trials.
     Normal,
+    /// Extended measurement profile with twenty-one trials.
     Thorough,
 }
 
@@ -160,7 +170,9 @@ impl Profile {
 #[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
 pub enum OrderMode {
     #[default]
+    /// Execute cases in registration order.
     Fixed,
+    /// Deterministically shuffle cases using the configured seed.
     Shuffle,
 }
 
@@ -180,11 +192,15 @@ pub struct RunConfig<'a> {
     pub mode: RunMode,
     pub profile: Profile,
     pub order: OrderMode,
+    /// Optional seed for deterministic benchmark ordering.
     pub seed: Option<u64>,
+    /// Optional substring that case identifiers must contain.
     pub filter: Option<&'a str>,
+    /// Optional case identifier through which execution is skipped, inclusively.
     pub resume_after: Option<&'a str>,
     pub allow_io: bool,
     pub allow_destructive: bool,
+    /// Optional ceiling on the hart count used for execution.
     pub max_harts: Option<usize>,
 }
 
@@ -203,6 +219,11 @@ impl<'a> RunConfig<'a> {
     }
 
     /// Applies space-delimited `key=value` parameters onto the current configuration.
+    ///
+    /// Unknown keys and invalid mode, profile, order, Boolean, or nonempty hart-limit values
+    /// preserve the current setting. An empty or invalid seed clears the previous seed.
+    /// Empty filter and resume values clear their settings; an empty or zero hart limit
+    /// removes the limit.
     pub fn apply_bootargs(&mut self, raw: &'a str) {
         for token in raw.trim_matches('\0').split_whitespace() {
             let Some((key, value)) = token.split_once('=') else {

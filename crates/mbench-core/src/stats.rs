@@ -9,17 +9,29 @@ pub const STATS_SCALE: u64 = 100;
 /// Nonparametric per-operation statistics (`STATS_SCALE = 100`) plus raw and net per-trial samples.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CounterStats {
+    /// Minimum net per-operation value multiplied by 100.
     pub min_x100: u64,
+    /// Net per-operation value at sorted index n / 4, multiplied by 100.
     pub p25_x100: u64,
+    /// Net per-operation value at sorted index n / 2, multiplied by 100.
     pub median_x100: u64,
+    /// Net per-operation value at sorted index 3n / 4, multiplied by 100.
     pub p75_x100: u64,
+    /// Net per-operation value at sorted index (n - 1) * 95 / 100, multiplied by 100.
     pub p95_x100: u64,
+    /// Maximum net per-operation value multiplied by 100.
     pub max_x100: u64,
+    /// Interquartile range of net per-operation values multiplied by 100.
     pub iqr_x100: u64,
+    /// Median unsubtracted batch total in native counter units.
     pub raw_batch_median: u64,
+    /// Whether the positive median has an interquartile range greater than 5% of it.
     pub is_noisy: bool,
+    /// Number of populated chronological sample slots.
     pub sample_count: usize,
+    /// Chronological unsubtracted per-trial batch totals in native counter units.
     pub raw_batch_totals: [u64; MAX_TRIALS],
+    /// Chronological overhead-subtracted per-operation samples multiplied by 100.
     pub net_samples_x100: [u64; MAX_TRIALS],
 }
 
@@ -59,15 +71,25 @@ impl CounterStats {
 /// Nanosecond summary statistics derived solely from net tick samples and FDT `timebase-frequency`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DerivedNsStats {
+    /// Minimum net per-operation value multiplied by 100.
     pub min_x100: u64,
+    /// Net per-operation value at sorted index n / 4, multiplied by 100.
     pub p25_x100: u64,
+    /// Net per-operation value at sorted index n / 2, multiplied by 100.
     pub median_x100: u64,
+    /// Net per-operation value at sorted index 3n / 4, multiplied by 100.
     pub p75_x100: u64,
+    /// Net per-operation value at sorted index (n - 1) * 95 / 100, multiplied by 100.
     pub p95_x100: u64,
+    /// Maximum net per-operation value multiplied by 100.
     pub max_x100: u64,
+    /// Interquartile range of net per-operation values multiplied by 100.
     pub iqr_x100: u64,
+    /// Noise classification inherited from the original tick samples.
     pub is_noisy: bool,
+    /// Number of populated chronological sample slots.
     pub sample_count: usize,
+    /// Chronological overhead-subtracted per-operation samples multiplied by 100.
     pub net_samples_x100: [u64; MAX_TRIALS],
 }
 
@@ -222,99 +244,10 @@ pub fn scale_stats_to_ns(ticks: &CounterStats, timebase_hz: u64) -> DerivedNsSta
 }
 
 #[cfg(feature = "std")]
-pub use host_stats::{DiffVerdict, SampleComparison, compare_samples};
+pub use host::{DiffVerdict, SampleComparison, compare_samples};
 
 #[cfg(feature = "std")]
-mod host_stats {
-    use anofox_statistics::{Alternative, mann_whitney_u};
-
-    /// Classification of the two-sample comparison between candidate and baseline distributions.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum DiffVerdict {
-        Faster,
-        Slower,
-        NoSignificantDiff,
-        DistributionDiff,
-        Identical,
-        InsufficientSamples,
-    }
-
-    /// Result of comparing candidate samples against baseline samples using Mann-Whitney U.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct SampleComparison {
-        pub ratio: Option<f64>,
-        pub p_value: Option<f64>,
-        pub verdict: DiffVerdict,
-    }
-
-    /// Compares two per-trial sample slices using `anofox_statistics::mann_whitney_u` (`alpha = 0.05`).
-    ///
-    /// Uses the exact permutation distribution when tie-free and small, or the tie-corrected
-    /// continuity-corrected normal approximation when ties exist.
-    pub fn compare_samples(
-        base_median_x100: u64,
-        cand_median_x100: u64,
-        base: &[u64],
-        cand: &[u64],
-    ) -> SampleComparison {
-        let ratio =
-            (base_median_x100 > 0).then(|| (cand_median_x100 as f64) / (base_median_x100 as f64));
-
-        if base.len() < 5 || cand.len() < 5 {
-            return SampleComparison {
-                ratio,
-                p_value: None,
-                verdict: DiffVerdict::InsufficientSamples,
-            };
-        }
-
-        let first = base[0];
-        if base.iter().all(|&v| v == first) && cand.iter().all(|&v| v == first) {
-            return SampleComparison {
-                ratio,
-                p_value: Some(1.0),
-                verdict: DiffVerdict::Identical,
-            };
-        }
-
-        let base_f: Vec<f64> = base.iter().map(|&v| v as f64).collect();
-        let cand_f: Vec<f64> = cand.iter().map(|&v| v as f64).collect();
-        let Ok(res) = mann_whitney_u(
-            &base_f,
-            &cand_f,
-            Alternative::TwoSided,
-            true,
-            true,
-            None,
-            None,
-        ) else {
-            return SampleComparison {
-                ratio,
-                p_value: None,
-                verdict: DiffVerdict::InsufficientSamples,
-            };
-        };
-
-        let p_value = res.p_value.clamp(0.0, 1.0);
-        let verdict = if p_value < 0.05 {
-            if cand_median_x100 < base_median_x100 {
-                DiffVerdict::Faster
-            } else if cand_median_x100 > base_median_x100 {
-                DiffVerdict::Slower
-            } else {
-                DiffVerdict::DistributionDiff
-            }
-        } else {
-            DiffVerdict::NoSignificantDiff
-        };
-
-        SampleComparison {
-            ratio,
-            p_value: Some(p_value),
-            verdict,
-        }
-    }
-}
+mod host;
 
 #[cfg(test)]
 mod tests {
