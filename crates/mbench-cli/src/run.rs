@@ -1,9 +1,14 @@
 //! Target orchestration with fixed-seed shuffle, per-case watchdog timeout, and crash recovery.
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, LineWriter, Write},
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,10 +17,10 @@ use mbench_core::{
     config::{OrderMode, Profile, RunMode},
     protocol,
     record::{BenchGroup, SbiExtensionId, SkipReason, StartKind},
-    validate::{audit_capture, audit_raw_attempt, summarize_records},
+    validate::{CaseTracker, audit_capture, audit_raw_attempt, summarize_records},
     wire::{
         AttemptRecord, BenchFrame, BenchStatusTag, CheckFrame, CheckStatusTag, EnvLine,
-        ShutdownStatus, StartFrame, WireFrame, parse_capture, parse_wire_line,
+        RawAttemptStart, ShutdownStatus, StartFrame, WireFrame, parse_capture, parse_wire_line,
     },
 };
 
@@ -27,6 +32,24 @@ const DEFAULT_TARGET: &str = "riscv64imac-unknown-none-elf";
 const MAX_RECOVERY_ATTEMPTS: usize = 8;
 const POST_END_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const POST_END_NO_SRST_GRACE: Duration = Duration::from_secs(1);
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static SIGNAL_HANDLER_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn ensure_signal_handler() -> Result<(), String> {
+    SIGNAL_HANDLER_INIT
+        .get_or_init(|| {
+            ctrlc::set_handler(|| {
+                INTERRUPTED.store(true, Ordering::SeqCst);
+            })
+            .map_err(|e| format!("failed to install signal handler: {e}"))
+        })
+        .clone()
+}
+
+fn is_interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
 
 /// Top-level execution mode selectable via `--mode`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -231,6 +254,12 @@ fn validate_run_args(args: &RunArgs) -> Result<(), String> {
     if let Some(raw_seed) = &args.seed {
         let _ = parse_seed_u64(raw_seed)?;
     }
+    if let Some(out_path) = &args.out {
+        validate_output_file_path("--out", out_path)?;
+    }
+    if let Some(raw_log) = &args.raw_log {
+        validate_output_file_path("--raw-log", raw_log)?;
+    }
     if let (Some(out_path), Some(raw_log)) = (&args.out, &args.raw_log)
         && paths_refer_to_same_file(out_path, raw_log)?
     {
@@ -239,6 +268,38 @@ fn validate_run_args(args: &RunArgs) -> Result<(), String> {
             out_path.display(),
             raw_log.display()
         ));
+    }
+    Ok(())
+}
+
+fn validate_output_file_path(flag: &str, path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() || path.file_name().is_none() {
+        return Err(format!(
+            "{flag} path '{}' must include a file name",
+            path.display()
+        ));
+    }
+    if path.exists() && path.is_dir() {
+        return Err(format!("{flag} path '{}' is a directory", path.display()));
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        for ancestor in parent.ancestors() {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            if ancestor.exists() {
+                if !ancestor.is_dir() {
+                    return Err(format!(
+                        "parent component '{}' of {flag} path '{}' is not a directory",
+                        ancestor.display(),
+                        path.display()
+                    ));
+                }
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -275,7 +336,20 @@ fn resolve_comparable_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn paths_refer_to_same_file(a: &Path, b: &Path) -> Result<bool, String> {
-    Ok(resolve_comparable_path(a)? == resolve_comparable_path(b)?)
+    if resolve_comparable_path(a)? == resolve_comparable_path(b)? {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(meta_a), Ok(meta_b)) = (fs::metadata(a), fs::metadata(b))
+            && meta_a.dev() == meta_b.dev()
+            && meta_a.ino() == meta_b.ino()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn parse_seed_u64(raw: &str) -> Result<u64, String> {
@@ -300,11 +374,91 @@ fn resolve_effective_seed(args: &RunArgs) -> Result<Option<u64>, String> {
     Ok(None)
 }
 
+struct RawLogWriter {
+    path: PathBuf,
+    writer: LineWriter<fs::File>,
+    had_write_error: bool,
+}
+
+impl RawLogWriter {
+    fn create(path: &Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        let file = fs::File::create(path)
+            .map_err(|e| format!("failed to create raw log {}: {e}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            writer: LineWriter::new(file),
+            had_write_error: false,
+        })
+    }
+
+    fn write_attempt_header(
+        &mut self,
+        attempt: usize,
+        resume_after: Option<&str>,
+    ) -> Option<String> {
+        let hdr = RawAttemptStart {
+            attempt,
+            resume_after: resume_after.map(str::to_string),
+        };
+        let Ok(json) = serde_json::to_string(&hdr) else {
+            return Some(String::from(
+                "failed to serialize # MBENCH_RAW_ATTEMPT header",
+            ));
+        };
+        if let Err(err) =
+            writeln!(self.writer, "# MBENCH_RAW_ATTEMPT {json}").and_then(|()| self.writer.flush())
+            && !self.had_write_error
+        {
+            self.had_write_error = true;
+            return Some(format!(
+                "failed to write raw log {}: {err}",
+                self.path.display()
+            ));
+        }
+        None
+    }
+
+    fn write_line(&mut self, line: &str) -> Option<String> {
+        if let Err(err) = writeln!(self.writer, "{line}")
+            && !self.had_write_error
+        {
+            self.had_write_error = true;
+            return Some(format!(
+                "failed to write raw log {}: {err}",
+                self.path.display()
+            ));
+        }
+        None
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        if let Err(err) = self.writer.flush()
+            && !self.had_write_error
+        {
+            self.had_write_error = true;
+            return Some(format!(
+                "failed to flush raw log {}: {err}",
+                self.path.display()
+            ));
+        }
+        None
+    }
+}
+
 pub(crate) fn execute_with_runner<R: TargetRunner>(
     runner: &R,
     args: &RunArgs,
     kernel_path: &Path,
 ) -> Result<(), String> {
+    INTERRUPTED.store(false, Ordering::SeqCst);
+    ensure_signal_handler()?;
+
     let label = args.name.clone().unwrap_or_else(|| {
         args.bios
             .file_stem()
@@ -316,14 +470,16 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
         .out
         .clone()
         .unwrap_or_else(|| PathBuf::from("results").join(format!("{label}.jsonl")));
-    if let Some(raw_log) = &args.raw_log
-        && paths_refer_to_same_file(&out_path, raw_log)?
-    {
-        return Err(format!(
-            "--out ('{}') and --raw-log ('{}') must not refer to the same file",
-            out_path.display(),
-            raw_log.display()
-        ));
+    validate_output_file_path("--out", &out_path)?;
+    if let Some(raw_log) = &args.raw_log {
+        validate_output_file_path("--raw-log", raw_log)?;
+        if paths_refer_to_same_file(&out_path, raw_log)? {
+            return Err(format!(
+                "--out ('{}') and --raw-log ('{}') must not refer to the same file",
+                out_path.display(),
+                raw_log.display()
+            ));
+        }
     }
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
@@ -331,6 +487,11 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
+
+    let mut raw_writer = match &args.raw_log {
+        Some(path) => Some(RawLogWriter::create(path)?),
+        None => None,
+    };
 
     let effective_seed = resolve_effective_seed(args)?;
 
@@ -359,15 +520,30 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
             serde_json::to_string(&env_line).map_err(|e| e.to_string())?
         )],
         quarantine_warnings: 0,
-        record_raw: args.raw_log.is_some(),
-        raw_lines: Vec::new(),
     };
 
+    let mut io_errors: Vec<String> = Vec::new();
     let mut resume_after: Option<String> = None;
     let mut completed_loop = false;
 
     for attempt in 0..=MAX_RECOVERY_ATTEMPTS {
+        if is_interrupted() {
+            let save_errs = save_outputs_independently(
+                &out_path,
+                Some(&render_frames(&state.frames)),
+                &mut raw_writer,
+            );
+            io_errors.extend(save_errs);
+            return Err(format_interrupted_error(&out_path, &io_errors));
+        }
+
         let current_resume = resume_after.clone();
+        if let Some(writer) = raw_writer.as_mut()
+            && let Some(err) = writer.write_attempt_header(attempt, current_resume.as_deref())
+        {
+            io_errors.push(err);
+        }
+
         let bootargs = build_bootargs(args, effective_seed, current_resume.as_deref());
         let launch_cfg = TargetLaunchConfig {
             bios: &args.bios,
@@ -382,15 +558,50 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
             &launch_cfg,
             Duration::from_secs(args.timeout.max(1)),
             &mut state,
+            raw_writer.as_mut(),
+            &mut io_errors,
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
-                persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
-                return Err(err);
+                let save_errs = save_outputs_independently(
+                    &out_path,
+                    Some(&render_frames(&state.frames)),
+                    &mut raw_writer,
+                );
+                io_errors.extend(save_errs);
+                return Err(append_io_errors(err, &io_errors));
             }
         };
 
         let protocol_errors = audit_raw_attempt(&outcome.raw_lines, outcome.saw_end);
+
+        if outcome.interrupted && !outcome.saw_end {
+            let mut synth_ids = Vec::with_capacity(outcome.stuck_cases.len());
+            for stuck in &outcome.stuck_cases {
+                state
+                    .frames
+                    .push(synthesize_fail_frame(stuck, "interrupted")?);
+                synth_ids.push(stuck.id.clone());
+            }
+            push_attempt_record(
+                &mut state,
+                AttemptRecord {
+                    attempt,
+                    resume_after: current_resume,
+                    saw_end: false,
+                    shutdown: ShutdownStatus::Interrupted,
+                    protocol_errors,
+                    synthesized_failures: synth_ids,
+                },
+            )?;
+            let save_errs = save_outputs_independently(
+                &out_path,
+                Some(&render_frames(&state.frames)),
+                &mut raw_writer,
+            );
+            io_errors.extend(save_errs);
+            return Err(format_interrupted_error(&out_path, &io_errors));
+        }
 
         if outcome.saw_end {
             let synthesized = append_unclosed_end_failures(&outcome.unclosed_at_end, &mut state)?;
@@ -456,43 +667,71 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
         )?;
 
         let Some(next_resume_id) = next_resume else {
-            persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
-            return Err(format!(
-                "target stopped ({:?}) before emitting @@MBENCH:END and no active case was recorded (saved outputs to {})",
-                outcome.shutdown,
-                out_path.display()
+            let save_errs = save_outputs_independently(
+                &out_path,
+                Some(&render_frames(&state.frames)),
+                &mut raw_writer,
+            );
+            io_errors.extend(save_errs);
+            return Err(append_io_errors(
+                format!(
+                    "target stopped ({:?}) before emitting @@MBENCH:END and no active case was recorded (saved partial capture to {})",
+                    outcome.shutdown,
+                    out_path.display()
+                ),
+                &io_errors,
             ));
         };
 
         if current_resume.as_deref() == Some(next_resume_id.as_str()) {
-            persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
-            return Err(format!(
-                "recovery stalled on '{next_resume_id}' across consecutive attempts (saved outputs to {})",
-                out_path.display()
+            let save_errs = save_outputs_independently(
+                &out_path,
+                Some(&render_frames(&state.frames)),
+                &mut raw_writer,
+            );
+            io_errors.extend(save_errs);
+            return Err(append_io_errors(
+                format!(
+                    "recovery stalled on '{next_resume_id}' across consecutive attempts (saved partial capture to {})",
+                    out_path.display()
+                ),
+                &io_errors,
             ));
         }
         resume_after = Some(next_resume_id);
     }
 
     if !completed_loop {
-        persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
-        return Err(format!(
-            "exceeded maximum recovery attempts ({MAX_RECOVERY_ATTEMPTS}) (saved outputs to {})",
-            out_path.display()
+        let save_errs = save_outputs_independently(
+            &out_path,
+            Some(&render_frames(&state.frames)),
+            &mut raw_writer,
+        );
+        io_errors.extend(save_errs);
+        return Err(append_io_errors(
+            format!(
+                "exceeded maximum recovery attempts ({MAX_RECOVERY_ATTEMPTS}) (saved partial capture to {})",
+                out_path.display()
+            ),
+            &io_errors,
         ));
     }
 
     let content = match finalize_merged_capture(&label, &mut state) {
         Ok(content) => content,
         Err(err) => {
-            persist_partial_outputs(&out_path, args.raw_log.as_deref(), &state);
-            return Err(err);
+            let save_errs = save_outputs_independently(
+                &out_path,
+                Some(&render_frames(&state.frames)),
+                &mut raw_writer,
+            );
+            io_errors.extend(save_errs);
+            return Err(append_io_errors(err, &io_errors));
         }
     };
-    fs::write(&out_path, &content)
-        .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
-    eprintln!("[mbench-cli] saved {}", out_path.display());
-    write_raw_log(args.raw_log.as_deref(), &state.raw_lines)?;
+
+    let save_errs = save_outputs_independently(&out_path, Some(&content), &mut raw_writer);
+    io_errors.extend(save_errs);
 
     let report = audit_capture(&label, &content);
     let mut errors = report.protocol_errors;
@@ -507,6 +746,8 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
             meta.hart_count, args.smp
         ));
     }
+    errors.extend(io_errors);
+
     if let Some(last) = report.attempts.last()
         && !matches!(
             last.shutdown,
@@ -523,52 +764,73 @@ pub(crate) fn execute_with_runner<R: TargetRunner>(
         Ok(())
     } else {
         Err(format!(
-            "capture integrity check failed (saved to {}):\n  - {}",
+            "run finished with errors (capture path: {}):\n  - {}",
             out_path.display(),
             errors.join("\n  - ")
         ))
     }
 }
 
+fn render_frames(frames: &[String]) -> String {
+    format!("{}\n", frames.join("\n"))
+}
+
+fn format_interrupted_error(out_path: &Path, io_errors: &[String]) -> String {
+    append_io_errors(
+        format!(
+            "interrupted by signal; saved partial capture to {}",
+            out_path.display()
+        ),
+        io_errors,
+    )
+}
+
+fn append_io_errors(msg: String, io_errors: &[String]) -> String {
+    if io_errors.is_empty() {
+        msg
+    } else {
+        format!("{msg}\noutput errors:\n  - {}", io_errors.join("\n  - "))
+    }
+}
+
+fn save_outputs_independently(
+    out_path: &Path,
+    out_content: Option<&str>,
+    raw_writer: &mut Option<RawLogWriter>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Some(content) = out_content {
+        let write_res = (|| -> Result<(), String> {
+            if let Some(parent) = out_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+            }
+            fs::write(out_path, content)
+                .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+            eprintln!("[mbench-cli] saved {}", out_path.display());
+            Ok(())
+        })();
+        if let Err(err) = write_res {
+            eprintln!("[mbench-cli] warning: {err}");
+            errors.push(err);
+        }
+    }
+    if let Some(writer) = raw_writer {
+        if let Some(err) = writer.flush() {
+            eprintln!("[mbench-cli] warning: {err}");
+            errors.push(err);
+        } else if !writer.had_write_error {
+            eprintln!("[mbench-cli] saved raw log {}", writer.path.display());
+        }
+    }
+    errors
+}
+
 fn push_attempt_record(state: &mut CaptureState, record: AttemptRecord) -> Result<(), String> {
     let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
     state.frames.push(format!("# MBENCH_ATTEMPT {json}"));
-    Ok(())
-}
-
-fn persist_partial_outputs(out_path: &Path, raw_log: Option<&Path>, state: &CaptureState) {
-    if state.frames.len() > 1 {
-        let partial = format!("{}\n", state.frames.join("\n"));
-        if let Err(err) = fs::write(out_path, partial) {
-            eprintln!(
-                "[mbench-cli] warning: failed to save partial capture {}: {err}",
-                out_path.display()
-            );
-        } else {
-            eprintln!("[mbench-cli] saved partial capture {}", out_path.display());
-        }
-    }
-    if let Err(err) = write_raw_log(raw_log, &state.raw_lines) {
-        eprintln!("[mbench-cli] warning: {err}");
-    }
-}
-
-fn write_raw_log(path: Option<&Path>, raw_lines: &[String]) -> Result<(), String> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-    let mut text = raw_lines.join("\n");
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    fs::write(path, text).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-    eprintln!("[mbench-cli] saved raw log {}", path.display());
     Ok(())
 }
 
@@ -591,7 +853,7 @@ fn append_unclosed_end_failures(
 }
 
 fn finalize_merged_capture(label: &str, state: &mut CaptureState) -> Result<String, String> {
-    let body = format!("{}\n", state.frames.join("\n"));
+    let body = render_frames(&state.frames);
     let parsed = parse_capture(label, &body)
         .map_err(|e| format!("captured output failed wire validation: {e}"))?;
     let merged_end = summarize_records(&parsed.checks, &parsed.benches, state.quarantine_warnings);
@@ -600,7 +862,7 @@ fn finalize_merged_capture(label: &str, state: &mut CaptureState) -> Result<Stri
         .map_err(|e| format!("failed to format END frame: {e}"))?;
     state.frames.push(end_line.trim_end().to_string());
 
-    let content = format!("{}\n", state.frames.join("\n"));
+    let content = render_frames(&state.frames);
     let _ = parse_capture(label, &content)
         .map_err(|e| format!("final capture failed wire validation: {e}"))?;
     Ok(content)
@@ -609,13 +871,12 @@ fn finalize_merged_capture(label: &str, state: &mut CaptureState) -> Result<Stri
 struct CaptureState {
     frames: Vec<String>,
     quarantine_warnings: usize,
-    record_raw: bool,
-    raw_lines: Vec<String>,
 }
 
 struct AttemptOutcome {
     raw_lines: Vec<String>,
     saw_end: bool,
+    interrupted: bool,
     shutdown: ShutdownStatus,
     stuck_cases: Vec<StartFrame>,
     unclosed_at_end: Vec<StartFrame>,
@@ -632,7 +893,7 @@ enum LineAction {
 }
 
 struct AttemptTracker {
-    active_cases: Vec<StartFrame>,
+    cases: CaseTracker,
     unclosed_at_end: Vec<StartFrame>,
     last_completed_id: Option<String>,
     saw_srst: Option<bool>,
@@ -643,7 +904,7 @@ struct AttemptTracker {
 impl AttemptTracker {
     const fn new() -> Self {
         Self {
-            active_cases: Vec::new(),
+            cases: CaseTracker::new(),
             unclosed_at_end: Vec::new(),
             last_completed_id: None,
             saw_srst: None,
@@ -655,12 +916,7 @@ impl AttemptTracker {
     fn process_line(&mut self, line: &str, state: &mut CaptureState) -> LineAction {
         match parse_wire_line(line) {
             Ok(Some(WireFrame::Start(start))) => {
-                let already_tracked = self.active_cases.iter().any(|s| {
-                    s.kind == start.kind && s.id == start.id && s.parallel == start.parallel
-                });
-                if !already_tracked {
-                    self.active_cases.push(start);
-                }
+                let _ = self.cases.record_start(start);
                 LineAction::ArmCaseDeadline
             }
             Ok(Some(WireFrame::Meta(meta))) => {
@@ -676,11 +932,10 @@ impl AttemptTracker {
                 if chk.skip_reason == Some(SkipReason::ResumedPast) {
                     return LineAction::RefreshPhaseIfIdle;
                 }
-                self.active_cases
-                    .retain(|s| !(s.kind == StartKind::Check && s.id == chk.id));
+                let _ = self.cases.close_check(&chk.id);
                 self.last_completed_id = Some(chk.id);
                 push_normalized_wire_line(line, &mut state.frames);
-                if self.active_cases.is_empty() {
+                if self.cases.is_empty() {
                     LineAction::ClearCaseAndRefreshPhase
                 } else {
                     LineAction::Continue
@@ -690,12 +945,10 @@ impl AttemptTracker {
                 if b.skip_reason == Some(SkipReason::ResumedPast) {
                     return LineAction::RefreshPhaseIfIdle;
                 }
-                self.active_cases.retain(|s| {
-                    !(s.kind == StartKind::Bench && s.id == b.id && s.parallel == b.parallel)
-                });
+                let _ = self.cases.close_bench(&b.id, b.parallel);
                 self.last_completed_id = Some(b.id);
                 push_normalized_wire_line(line, &mut state.frames);
-                if self.active_cases.is_empty() {
+                if self.cases.is_empty() {
                     LineAction::ClearCaseAndRefreshPhase
                 } else {
                     LineAction::Continue
@@ -706,7 +959,7 @@ impl AttemptTracker {
                 state.quarantine_warnings = state
                     .quarantine_warnings
                     .saturating_add(end.quarantine_warnings);
-                self.unclosed_at_end.append(&mut self.active_cases);
+                self.unclosed_at_end.extend(self.cases.drain_all());
                 LineAction::ArmShutdownDeadline
             }
             Ok(Some(WireFrame::Panic(_))) => {
@@ -715,7 +968,9 @@ impl AttemptTracker {
                 println!("{line}");
                 LineAction::StopSession
             }
-            Ok(Some(WireFrame::Env(_) | WireFrame::Attempt(_))) => LineAction::Continue,
+            Ok(Some(WireFrame::Env(_) | WireFrame::Attempt(_) | WireFrame::RawAttemptStart(_))) => {
+                LineAction::Continue
+            }
             Ok(None) => {
                 println!("{line}");
                 LineAction::Continue
@@ -728,7 +983,15 @@ impl AttemptTracker {
         }
     }
 
-    fn classify_shutdown(&self, timed_out: bool, exit_status: SessionExit) -> ShutdownStatus {
+    fn classify_shutdown(
+        &self,
+        timed_out: bool,
+        interrupted: bool,
+        exit_status: SessionExit,
+    ) -> ShutdownStatus {
+        if interrupted && !self.saw_end {
+            return ShutdownStatus::Interrupted;
+        }
         if self.saw_panic && !self.saw_end {
             return ShutdownStatus::AbortedOnPanic;
         }
@@ -765,20 +1028,22 @@ impl AttemptTracker {
     }
 
     fn into_outcome(
-        self,
+        mut self,
         raw_lines: Vec<String>,
         timed_out: bool,
+        interrupted: bool,
         exit_status: SessionExit,
     ) -> AttemptOutcome {
-        let shutdown = self.classify_shutdown(timed_out, exit_status);
+        let shutdown = self.classify_shutdown(timed_out, interrupted, exit_status);
         let stuck_cases = if self.saw_end {
             Vec::new()
         } else {
-            self.active_cases
+            self.cases.drain_all()
         };
         AttemptOutcome {
             raw_lines,
             saw_end: self.saw_end,
+            interrupted,
             shutdown,
             stuck_cases,
             unclosed_at_end: self.unclosed_at_end,
@@ -787,11 +1052,30 @@ impl AttemptTracker {
     }
 }
 
+fn record_and_handle_line(
+    line: String,
+    tracker: &mut AttemptTracker,
+    state: &mut CaptureState,
+    attempt_raw_lines: &mut Vec<String>,
+    raw_writer: Option<&mut RawLogWriter>,
+    io_errors: &mut Vec<String>,
+) -> LineAction {
+    if let Some(writer) = raw_writer
+        && let Some(err) = writer.write_line(&line)
+    {
+        io_errors.push(err);
+    }
+    attempt_raw_lines.push(line.clone());
+    tracker.process_line(&line, state)
+}
+
 fn run_single_attempt<R: TargetRunner>(
     runner: &R,
     cfg: &TargetLaunchConfig<'_>,
     timeout: Duration,
     state: &mut CaptureState,
+    mut raw_writer: Option<&mut RawLogWriter>,
+    io_errors: &mut Vec<String>,
 ) -> Result<AttemptOutcome, String> {
     let mut session = runner.launch(cfg)?;
     let mut phase_deadline = Instant::now() + timeout;
@@ -799,9 +1083,16 @@ fn run_single_attempt<R: TargetRunner>(
     let mut tracker = AttemptTracker::new();
     let mut attempt_raw_lines = Vec::new();
     let mut timed_out = false;
+    let mut interrupted = false;
     let mut stopped_early = false;
 
     loop {
+        if is_interrupted() {
+            interrupted = true;
+            stopped_early = true;
+            let _ = session.terminate_and_wait();
+            break;
+        }
         let now = Instant::now();
         let active_deadline = case_deadline.unwrap_or(phase_deadline);
         if now >= active_deadline {
@@ -812,15 +1103,19 @@ fn run_single_attempt<R: TargetRunner>(
         }
         let wait_for = active_deadline
             .saturating_duration_since(now)
-            .min(Duration::from_millis(200));
+            .min(Duration::from_millis(100));
 
         match session.next_event(wait_for) {
             Ok(Some(SessionEvent::Line(line))) => {
-                if state.record_raw {
-                    state.raw_lines.push(line.clone());
-                }
-                attempt_raw_lines.push(line.clone());
-                match tracker.process_line(&line, state) {
+                let action = record_and_handle_line(
+                    line,
+                    &mut tracker,
+                    state,
+                    &mut attempt_raw_lines,
+                    raw_writer.as_deref_mut(),
+                    io_errors,
+                );
+                match action {
                     LineAction::Continue => {}
                     LineAction::ArmCaseDeadline => case_deadline = Some(Instant::now() + timeout),
                     LineAction::RefreshPhaseIfIdle => {
@@ -868,7 +1163,11 @@ fn run_single_attempt<R: TargetRunner>(
         match session.wait_for_exit(exit_grace) {
             Ok(Some(exit)) => exit,
             Ok(None) => {
-                timed_out = true;
+                if is_interrupted() {
+                    interrupted = true;
+                } else {
+                    timed_out = true;
+                }
                 session.terminate_and_wait()
             }
             Err(err) => {
@@ -877,7 +1176,24 @@ fn run_single_attempt<R: TargetRunner>(
             }
         }
     };
-    Ok(tracker.into_outcome(attempt_raw_lines, timed_out, exit_status))
+
+    // Drain any buffered serial lines delivered before the reader joined.
+    while let Ok(Some(SessionEvent::Line(line))) = session.next_event(Duration::ZERO) {
+        let _ = record_and_handle_line(
+            line,
+            &mut tracker,
+            state,
+            &mut attempt_raw_lines,
+            raw_writer.as_deref_mut(),
+            io_errors,
+        );
+    }
+
+    if is_interrupted() {
+        interrupted = true;
+    }
+
+    Ok(tracker.into_outcome(attempt_raw_lines, timed_out, interrupted, exit_status))
 }
 
 fn push_normalized_wire_line(raw_line: &str, out: &mut Vec<String>) {
@@ -1038,7 +1354,7 @@ fn convert_elf_to_binary(elf: &Path, bin: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     use mbench_core::{config::ClockRegime, protocol::write_cal_line, record::CalibrationRecord};
 
@@ -1163,6 +1479,7 @@ mod tests {
         let mut state = CaptureState {
             frames: vec![
                 format!("# MBENCH_ENV {env_hdr}"),
+                "@@MBENCH:META {\"sbi_spec_version\":50331648,\"impl_id\":1,\"impl_version\":1,\"mvendorid\":0,\"marchid\":0,\"mimpid\":0,\"extensions\":[\"base\"],\"extensions_mask\":1,\"hart_count\":2,\"boot_hart_id\":0,\"timebase_hz\":10000000,\"has_cycle\":true,\"has_instret\":true,\"has_time\":true,\"is_rdtime_emulated\":false,\"is_pmu_gated\":false,\"has_sstc\":false,\"has_h_ext\":false,\"boot_ticks\":1,\"reserved_mem_bytes\":0,\"console_backend\":\"dbcn\",\"pmu_counter_count\":0,\"load_addr\":2149580800}".to_string(),
                 cal0.trim().to_string(),
                 check_line,
                 sweep_p1,
@@ -1171,8 +1488,6 @@ mod tests {
                 sweep_p2_fail,
             ],
             quarantine_warnings: 2,
-            record_raw: false,
-            raw_lines: Vec::new(),
         };
         let merged = finalize_merged_capture("fw", &mut state).unwrap();
         let cap = parse_capture("fw", &merged).unwrap();
@@ -1203,15 +1518,13 @@ mod tests {
         let mut state = CaptureState {
             frames: Vec::new(),
             quarantine_warnings: 0,
-            record_raw: false,
-            raw_lines: Vec::new(),
         };
         let mut tracker = AttemptTracker::new();
         for line in lines {
             let _ = tracker.process_line(line, &mut state);
         }
         let raw_vec: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
-        let outcome = tracker.into_outcome(raw_vec, false, SessionExit::Exited(Some(0)));
+        let outcome = tracker.into_outcome(raw_vec, false, false, SessionExit::Exited(Some(0)));
         assert!(outcome.saw_end);
         assert_eq!(outcome.unclosed_at_end.len(), 1);
         assert_eq!(outcome.unclosed_at_end[0].id, "conformance/base");
@@ -1230,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_run_args_and_rejects_colliding_output_paths() {
+    fn validates_output_paths_hardlinks_and_independent_saving() {
         let dir = TestWorkDir::new("args");
         let bios = dir.0.join("fw.bin");
         fs::write(&bios, b"fw").unwrap();
@@ -1243,39 +1556,44 @@ mod tests {
         };
         assert!(validate_run_args(&base_args()).is_ok());
 
-        let mut bad_timeout = base_args();
-        bad_timeout.timeout = 0;
-        assert!(validate_run_args(&bad_timeout).is_err());
+        let mut dir_out = base_args();
+        dir_out.out = Some(dir.0.clone());
+        let err = validate_run_args(&dir_out).unwrap_err();
+        assert!(err.contains("is a directory"), "{err}");
 
-        let mut empty_filter = base_args();
-        empty_filter.filter = Some(String::new());
-        assert!(validate_run_args(&empty_filter).is_err());
+        let mut dir_raw = base_args();
+        dir_raw.raw_log = Some(dir.0.clone());
+        let err = validate_run_args(&dir_raw).unwrap_err();
+        assert!(err.contains("is a directory"), "{err}");
 
-        let mut space_filter = base_args();
-        space_filter.filter = Some(String::from("base/ time/"));
-        assert!(validate_run_args(&space_filter).is_err());
+        let mut bad_parent = base_args();
+        bad_parent.out = Some(bios.join("nested.jsonl"));
+        let err = validate_run_args(&bad_parent).unwrap_err();
+        assert!(err.contains("is not a directory"), "{err}");
 
-        let mut empty_name = base_args();
-        empty_name.name = Some(String::from("   "));
-        assert!(validate_run_args(&empty_name).is_err());
+        // Two distinct paths pointing to the same hardlinked file must be rejected.
+        let link_a = dir.0.join("link-a.log");
+        let link_b = dir.0.join("link-b.log");
+        fs::write(&link_a, b"existing").unwrap();
+        fs::hard_link(&link_a, &link_b).unwrap();
+        let mut hardlinked = base_args();
+        hardlinked.out = Some(link_a.clone());
+        hardlinked.raw_log = Some(link_b.clone());
+        let err = validate_run_args(&hardlinked).unwrap_err();
+        assert!(err.contains("same file"), "{err}");
 
-        let mut path_name = base_args();
-        path_name.name = Some(String::from("../escape"));
-        assert!(validate_run_args(&path_name).is_err());
-
-        let mut missing_kernel = base_args();
-        missing_kernel.kernel = Some(dir.0.join("missing-kernel.bin"));
-        assert!(validate_run_args(&missing_kernel).is_err());
-
-        let mut colliding = base_args();
-        colliding.out = Some(dir.0.join("sub/../out.log"));
-        colliding.raw_log = Some(dir.0.join("out.log"));
-        let err = validate_run_args(&colliding).unwrap_err();
-        assert!(err.contains("same file"));
-
-        let mut non_colliding = base_args();
-        non_colliding.out = Some(dir.0.join("out.jsonl"));
-        non_colliding.raw_log = Some(dir.0.join("out.log"));
-        assert!(validate_run_args(&non_colliding).is_ok());
+        // Failing to write one output must not skip flushing/saving the other output.
+        let raw_ok = dir.0.join("independent.log");
+        let mut writer = Some(RawLogWriter::create(&raw_ok).unwrap());
+        assert!(
+            writer
+                .as_mut()
+                .unwrap()
+                .write_line("serial line 1")
+                .is_none()
+        );
+        let errs = save_outputs_independently(&dir.0, Some("payload"), &mut writer);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(fs::read_to_string(&raw_ok).unwrap(), "serial line 1\n");
     }
 }

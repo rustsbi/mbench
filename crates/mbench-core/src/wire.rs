@@ -256,10 +256,19 @@ pub enum ShutdownStatus {
     CleanExit,
     NonZeroExit { code: i32 },
     Signaled,
+    Interrupted,
     TimedOutAfterEnd,
     HostTerminatedAfterEnd,
     TimedOutDuringRun,
     AbortedOnPanic,
+}
+
+/// Explicit attempt boundary marker written into multi-attempt raw serial logs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RawAttemptStart {
+    pub attempt: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after: Option<String>,
 }
 
 /// Host-side audit record appended after each target execution attempt.
@@ -296,6 +305,7 @@ pub struct PanicFrame {
 pub enum WireFrame {
     Env(EnvLine),
     Attempt(AttemptRecord),
+    RawAttemptStart(RawAttemptStart),
     Meta(MetaFrame),
     Cal(CalFrame),
     Start(StartFrame),
@@ -336,6 +346,11 @@ pub fn parse_wire_line(raw_line: &str) -> Result<Option<WireFrame>, String> {
         let attempt: AttemptRecord =
             serde_json::from_str(json).map_err(|e| format!("invalid MBENCH_ATTEMPT frame: {e}"))?;
         return Ok(Some(WireFrame::Attempt(attempt)));
+    }
+    if let Some(json) = line.strip_prefix("# MBENCH_RAW_ATTEMPT ") {
+        let boundary: RawAttemptStart = serde_json::from_str(json)
+            .map_err(|e| format!("invalid MBENCH_RAW_ATTEMPT frame: {e}"))?;
+        return Ok(Some(WireFrame::RawAttemptStart(boundary)));
     }
 
     let Some(pos) = line.find("@@MBENCH:") else {
@@ -427,6 +442,7 @@ pub fn parse_capture(default_label: &str, text: &str) -> Result<ParsedCapture, S
                 env_hdr = Some(env);
             }
             WireFrame::Attempt(attempt) => attempts.push(attempt),
+            WireFrame::RawAttemptStart(_) => {}
             WireFrame::Meta(m) => {
                 meta = Some(m);
                 active_cal_index = None;
@@ -975,5 +991,30 @@ mod tests {
         assert_eq!(parsed_cfg.profile, Profile::Quick);
         assert_eq!(parsed_cfg.filter.as_deref(), Some("base/"));
         assert!(parsed_cfg.allow_io);
+
+        let raw_hdr = parse_wire_line(
+            "# MBENCH_RAW_ATTEMPT {\"attempt\":1,\"resume_after\":\"conformance/time\"}",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            raw_hdr,
+            WireFrame::RawAttemptStart(RawAttemptStart {
+                attempt: 1,
+                resume_after: Some(String::from("conformance/time")),
+            })
+        );
+        let inter_att = parse_wire_line(
+            "# MBENCH_ATTEMPT {\"attempt\":0,\"saw_end\":false,\"shutdown\":{\"kind\":\"interrupted\"}}",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            inter_att,
+            WireFrame::Attempt(AttemptRecord {
+                shutdown: ShutdownStatus::Interrupted,
+                ..
+            })
+        ));
     }
 }

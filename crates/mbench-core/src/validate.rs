@@ -8,12 +8,77 @@ use crate::{
     record::{BenchGroup, EndRecord, SkipReason, StartKind},
     wire::{
         AttemptRecord, BenchFrame, BenchStatusTag, CheckFrame, CheckStatusTag, EndFrame, EnvLine,
-        MetaFrame, PanicFrame, StartFrame, WireFrame, parse_capture, parse_wire_line,
+        MetaFrame, PanicFrame, StartFrame, WireFrame, parse_wire_line,
     },
 };
 
 const fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Shared `@@MBENCH:START` to result matcher used by both live monitoring and offline auditing.
+#[derive(Clone, Debug, Default)]
+pub struct CaseTracker {
+    active: Vec<StartFrame>,
+}
+
+impl CaseTracker {
+    /// Creates an empty tracker.
+    pub const fn new() -> Self {
+        Self { active: Vec::new() }
+    }
+
+    /// Records a started case, returning `false` when an identical active start already exists.
+    pub fn record_start(&mut self, start: StartFrame) -> bool {
+        let already_open = self
+            .active
+            .iter()
+            .any(|s| s.kind == start.kind && s.id == start.id && s.parallel == start.parallel);
+        if already_open {
+            false
+        } else {
+            self.active.push(start);
+            true
+        }
+    }
+
+    /// Closes the active `CHECK` start entry for `id`, returning `true` when found.
+    pub fn close_check(&mut self, id: &str) -> bool {
+        if let Some(pos) = self
+            .active
+            .iter()
+            .position(|s| s.kind == StartKind::Check && s.id == id)
+        {
+            self.active.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Closes the active `BENCH` start entry for `(id, parallel)`, returning `true` when found.
+    pub fn close_bench(&mut self, id: &str, parallel: usize) -> bool {
+        if let Some(pos) = self
+            .active
+            .iter()
+            .position(|s| s.kind == StartKind::Bench && s.id == id && s.parallel == parallel)
+        {
+            self.active.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` when no started case is currently open.
+    pub fn is_empty(&self) -> bool {
+        self.active.is_empty()
+    }
+
+    /// Drains all remaining open start frames in insertion order.
+    pub fn drain_all(&mut self) -> Vec<StartFrame> {
+        std::mem::take(&mut self.active)
+    }
 }
 
 /// Source format detected for an audited capture.
@@ -174,53 +239,203 @@ pub fn summarize_records(
     end
 }
 
-/// Audits a single raw serial execution attempt for framing, START/result closure, and END integrity.
+/// Audits a single raw serial execution attempt for framing, ordering, START closure, and END integrity.
 pub fn audit_raw_attempt(raw_lines: &[String], expect_end: bool) -> Vec<String> {
     let lines: Vec<&str> = raw_lines.iter().map(String::as_str).collect();
-    audit_stream_lines(&lines, true, expect_end)
+    audit_stream_lines(&lines, 0, true, expect_end).errors
 }
 
 /// Audits a saved `.jsonl` capture or raw serial log and exports a structured [`CaptureReport`].
+///
+/// Always retains all validly parsed facts even when malformed lines or truncated attempts occur.
 pub fn audit_capture(source: &str, text: &str) -> CaptureReport {
     let lines: Vec<&str> = text.lines().collect();
     let is_merged = lines
         .iter()
         .any(|line| line.starts_with("# MBENCH_ENV ") || line.starts_with("# MBENCH_ATTEMPT "));
-    let format = if is_merged {
-        CaptureFormat::MergedJsonl
-    } else {
-        CaptureFormat::RawSerial
-    };
 
-    let mut protocol_errors = match format {
-        CaptureFormat::RawSerial => audit_stream_lines(&lines, true, true),
-        CaptureFormat::MergedJsonl => audit_stream_lines(&lines, false, true),
-    };
+    if is_merged {
+        return audit_merged_jsonl(source, &lines);
+    }
 
-    let parsed = match parse_capture(source, text) {
-        Ok(cap) => cap,
-        Err(err) => {
-            if protocol_errors.is_empty() {
-                protocol_errors.push(format!("capture parse failed: {err}"));
-            }
-            return CaptureReport {
-                source: source.to_string(),
-                format,
-                protocol_valid: false,
-                completed: false,
-                recovered: false,
-                protocol_errors,
-                env: None,
-                meta: None,
-                panic: None,
-                end: None,
-                counts: CaptureCounts::default(),
-                attempts: Vec::new(),
-                checks: Vec::new(),
-                benches: Vec::new(),
-            };
+    let has_raw_attempt_markers = lines
+        .iter()
+        .any(|line| line.starts_with("# MBENCH_RAW_ATTEMPT "));
+    if has_raw_attempt_markers {
+        return audit_multi_attempt_raw(source, &lines);
+    }
+
+    audit_single_attempt_raw(source, &lines)
+}
+
+fn audit_single_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
+    let parsed = audit_stream_lines(lines, 0, true, true);
+    let mut protocol_errors = parsed.errors;
+    if !parsed.any_frame_seen && protocol_errors.is_empty() {
+        protocol_errors.push(format!("no @@MBENCH frames found in '{source}'"));
+    }
+    let completed = parsed.any_frame_seen && parsed.end.is_some() && parsed.panic.is_none();
+    let quarantine = parsed.end.map_or(0, |e| e.quarantine_warnings);
+    let counts = CaptureCounts::from_end(&summarize_records(
+        &parsed.checks,
+        &parsed.benches,
+        quarantine,
+    ));
+
+    build_report(
+        source.to_string(),
+        CaptureFormat::RawSerial,
+        completed,
+        false,
+        protocol_errors,
+        parsed.env,
+        parsed.meta,
+        parsed.panic,
+        parsed.end,
+        counts,
+        Vec::new(),
+        parsed.checks,
+        parsed.benches,
+    )
+}
+
+fn audit_multi_attempt_raw(source: &str, lines: &[&str]) -> CaptureReport {
+    let mut protocol_errors = Vec::new();
+    let mut sections: Vec<(Option<usize>, usize, &[&str])> = Vec::new();
+    let mut marker_indices = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if line.starts_with("# MBENCH_RAW_ATTEMPT ") {
+            marker_indices.push(idx);
         }
-    };
+    }
+
+    let first_marker = marker_indices[0];
+    for (idx, raw_line) in lines[..first_marker].iter().enumerate() {
+        let line_no = idx + 1;
+        let has_prefix = raw_line.contains("@@MBENCH:");
+        match parse_wire_line(raw_line) {
+            Ok(Some(_)) => protocol_errors.push(format!(
+                "line {line_no}: unexpected @@MBENCH frame before first # MBENCH_RAW_ATTEMPT marker"
+            )),
+            Ok(None) if has_prefix => protocol_errors.push(format!(
+                "line {line_no}: malformed or unknown @@MBENCH directive before first # MBENCH_RAW_ATTEMPT marker"
+            )),
+            Ok(None) => {}
+            Err(err) => protocol_errors.push(format!("line {line_no}: {err}")),
+        }
+    }
+
+    for (pos, &marker_idx) in marker_indices.iter().enumerate() {
+        let marker_line_no = marker_idx + 1;
+        let attempt_num = match parse_wire_line(lines[marker_idx]) {
+            Ok(Some(WireFrame::RawAttemptStart(boundary))) => {
+                if boundary.attempt != pos {
+                    protocol_errors.push(format!(
+                        "line {marker_line_no}: unexpected attempt index {} (expected {pos})",
+                        boundary.attempt
+                    ));
+                }
+                Some(boundary.attempt)
+            }
+            Ok(_) => {
+                protocol_errors.push(format!(
+                    "line {marker_line_no}: malformed # MBENCH_RAW_ATTEMPT marker"
+                ));
+                None
+            }
+            Err(err) => {
+                protocol_errors.push(format!("line {marker_line_no}: {err}"));
+                None
+            }
+        };
+        let end_idx = marker_indices.get(pos + 1).copied().unwrap_or(lines.len());
+        sections.push((attempt_num, marker_idx + 1, &lines[marker_idx + 1..end_idx]));
+    }
+
+    let total_sections = sections.len();
+    let mut any_frame_seen = false;
+    let mut latest_env = None;
+    let mut latest_meta = None;
+    let mut latest_panic = None;
+    let mut last_end = None;
+    let mut total_quarantine = 0usize;
+    let mut last_saw_end = false;
+    let mut last_saw_panic = false;
+    let mut check_order = Vec::new();
+    let mut check_map = BTreeMap::new();
+    let mut bench_order = Vec::new();
+    let mut bench_map = BTreeMap::new();
+
+    for (sec_idx, (attempt_num, start_offset, sec_lines)) in sections.into_iter().enumerate() {
+        let is_last = sec_idx + 1 == total_sections;
+        let sec = audit_stream_lines(sec_lines, start_offset, true, is_last);
+        let prefix = match attempt_num {
+            Some(n) => format!("attempt {n}"),
+            None => format!("section {sec_idx}"),
+        };
+        for err in sec.errors {
+            protocol_errors.push(format!("{prefix}: {err}"));
+        }
+
+        any_frame_seen |= sec.any_frame_seen;
+        if let Some(env) = sec.env {
+            latest_env = Some(env);
+        }
+        if let Some(meta) = sec.meta {
+            latest_meta = Some(meta);
+        }
+        if let Some(panic) = sec.panic {
+            latest_panic = Some(panic);
+        }
+        if let Some(end) = sec.end {
+            total_quarantine = total_quarantine.saturating_add(end.quarantine_warnings);
+            last_end = Some(end);
+        } else if is_last {
+            last_end = None;
+        }
+        for chk in sec.checks {
+            merge_check_into(&mut check_order, &mut check_map, chk);
+        }
+        for bench in sec.benches {
+            merge_bench_into(&mut bench_order, &mut bench_map, bench);
+        }
+        if is_last {
+            last_saw_end = sec.end.is_some();
+            last_saw_panic = sec.saw_panic;
+        }
+    }
+
+    if !any_frame_seen && protocol_errors.is_empty() {
+        protocol_errors.push(format!("no @@MBENCH frames found in '{source}'"));
+    }
+
+    let checks = finalize_check_order(check_order, &mut check_map);
+    let benches = finalize_bench_order(bench_order, &mut bench_map);
+    let counts = CaptureCounts::from_end(&summarize_records(&checks, &benches, total_quarantine));
+    let completed = any_frame_seen && last_saw_end && !last_saw_panic;
+    let recovered = total_sections > 1;
+
+    build_report(
+        source.to_string(),
+        CaptureFormat::RawSerial,
+        completed,
+        recovered,
+        protocol_errors,
+        latest_env,
+        latest_meta,
+        latest_panic,
+        last_end,
+        counts,
+        Vec::new(),
+        checks,
+        benches,
+    )
+}
+
+fn audit_merged_jsonl(source: &str, lines: &[&str]) -> CaptureReport {
+    let parsed = audit_stream_lines(lines, 0, false, true);
+    let mut protocol_errors = parsed.errors;
 
     for attempt in &parsed.attempts {
         for err in &attempt.protocol_errors {
@@ -228,29 +443,67 @@ pub fn audit_capture(source: &str, text: &str) -> CaptureReport {
         }
     }
 
-    if let Some(end) = &parsed.end {
-        let computed = summarize_records(&parsed.checks, &parsed.benches, end.quarantine_warnings);
-        if format == CaptureFormat::MergedJsonl {
-            compare_end_counts("merged capture", &computed, end, &mut protocol_errors);
-        }
+    if !parsed.any_frame_seen && protocol_errors.is_empty() {
+        protocol_errors.push(format!("no @@MBENCH frames found in '{source}'"));
     }
 
-    let computed_counts = summarize_records(
+    if let Some(end) = &parsed.end {
+        let computed = summarize_records(&parsed.checks, &parsed.benches, end.quarantine_warnings);
+        compare_end_counts("merged capture", &computed, end, &mut protocol_errors);
+    }
+
+    let quarantine = parsed.end.map_or(0, |e| e.quarantine_warnings);
+    let counts = CaptureCounts::from_end(&summarize_records(
         &parsed.checks,
         &parsed.benches,
-        parsed.end.map_or(0, |e| e.quarantine_warnings),
-    );
+        quarantine,
+    ));
     let recovered = parsed.attempts.len() > 1
         || parsed.checks.iter().any(|c| c.synthetic)
         || parsed.benches.iter().any(|b| b.synthetic);
     let last_attempt_complete = parsed.attempts.last().is_none_or(|attempt| attempt.saw_end);
-    let completed = match format {
-        CaptureFormat::RawSerial => parsed.end.is_some() && parsed.panic.is_none(),
-        CaptureFormat::MergedJsonl => parsed.end.is_some() && last_attempt_complete,
-    };
+    let completed = parsed.any_frame_seen && parsed.end.is_some() && last_attempt_complete;
+    let label = parsed
+        .env
+        .as_ref()
+        .and_then(|e| e.label.clone())
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| source.to_string());
 
-    let checks = parsed
-        .checks
+    build_report(
+        label,
+        CaptureFormat::MergedJsonl,
+        completed,
+        recovered,
+        protocol_errors,
+        parsed.env,
+        parsed.meta,
+        parsed.panic,
+        parsed.end,
+        counts,
+        parsed.attempts,
+        parsed.checks,
+        parsed.benches,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn build_report(
+    source: String,
+    format: CaptureFormat,
+    completed: bool,
+    recovered: bool,
+    protocol_errors: Vec<String>,
+    env: Option<EnvLine>,
+    meta: Option<MetaFrame>,
+    panic: Option<PanicFrame>,
+    end: Option<EndFrame>,
+    counts: CaptureCounts,
+    attempts: Vec<AttemptRecord>,
+    checks: Vec<CheckFrame>,
+    benches: Vec<BenchFrame>,
+) -> CaptureReport {
+    let check_summaries = checks
         .into_iter()
         .map(|chk| CheckSummary {
             id: chk.id,
@@ -264,8 +517,7 @@ pub fn audit_capture(source: &str, text: &str) -> CaptureReport {
             synthetic: chk.synthetic,
         })
         .collect();
-    let benches = parsed
-        .benches
+    let bench_summaries = benches
         .into_iter()
         .map(|bench| BenchSummary {
             id: bench.id,
@@ -279,39 +531,72 @@ pub fn audit_capture(source: &str, text: &str) -> CaptureReport {
         .collect();
 
     CaptureReport {
-        source: parsed.label,
+        source,
         format,
         protocol_valid: protocol_errors.is_empty(),
         completed,
         recovered,
         protocol_errors,
-        env: parsed.env,
-        meta: parsed.meta,
-        panic: parsed.panic,
-        end: parsed.end,
-        counts: CaptureCounts::from_end(&computed_counts),
-        attempts: parsed.attempts,
-        checks,
-        benches,
+        env,
+        meta,
+        panic,
+        end,
+        counts,
+        attempts,
+        checks: check_summaries,
+        benches: bench_summaries,
     }
 }
 
-fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool) -> Vec<String> {
+struct StreamAuditResult {
+    errors: Vec<String>,
+    any_frame_seen: bool,
+    env: Option<EnvLine>,
+    attempts: Vec<AttemptRecord>,
+    meta: Option<MetaFrame>,
+    panic: Option<PanicFrame>,
+    end: Option<EndFrame>,
+    saw_panic: bool,
+    checks: Vec<CheckFrame>,
+    benches: Vec<BenchFrame>,
+}
+
+fn audit_stream_lines(
+    lines: &[&str],
+    line_offset: usize,
+    raw_single_attempt: bool,
+    expect_end: bool,
+) -> StreamAuditResult {
     let mut errors = Vec::new();
-    let mut open_starts: Vec<StartFrame> = Vec::new();
+    let mut any_frame_seen = false;
+    let mut env = None;
+    let mut attempts = Vec::new();
+    let mut meta = None;
+    let mut panic = None;
+    let mut end = None;
+
+    let mut tracker = CaseTracker::new();
     let mut raw_checks: Vec<CheckFrame> = Vec::new();
     let mut raw_benches: Vec<BenchFrame> = Vec::new();
     let mut seen_check_keys: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen_bench_keys: BTreeMap<(String, usize), usize> = BTreeMap::new();
+    let mut check_order: Vec<String> = Vec::new();
+    let mut check_map: BTreeMap<String, CheckFrame> = BTreeMap::new();
+    let mut bench_order: Vec<(String, usize)> = Vec::new();
+    let mut bench_map: BTreeMap<(String, usize), BenchFrame> = BTreeMap::new();
+
     let mut meta_count = 0usize;
     let mut saw_end = false;
     let mut saw_panic = false;
 
     for (idx, raw_line) in lines.iter().enumerate() {
-        let line_no = idx + 1;
+        let line_no = line_offset + idx + 1;
         let has_mbench_prefix = raw_line.contains("@@MBENCH:");
         let frame = match parse_wire_line(raw_line) {
-            Ok(Some(f)) => f,
+            Ok(Some(f)) => {
+                any_frame_seen = true;
+                f
+            }
             Ok(None) => {
                 if has_mbench_prefix {
                     errors.push(format!(
@@ -327,13 +612,22 @@ fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool
         };
 
         match frame {
-            WireFrame::Env(_) | WireFrame::Attempt(_) => {}
-            WireFrame::Meta(_) => {
+            WireFrame::Env(e) => env = Some(e),
+            WireFrame::Attempt(a) => attempts.push(a),
+            WireFrame::RawAttemptStart(_) => {
+                if raw_single_attempt {
+                    errors.push(format!(
+                        "line {line_no}: unexpected # MBENCH_RAW_ATTEMPT boundary inside attempt"
+                    ));
+                }
+            }
+            WireFrame::Meta(m) => {
                 if saw_end {
                     errors.push(format!(
                         "line {line_no}: unexpected @@MBENCH:META frame after END"
                     ));
                 } else {
+                    meta = Some(m);
                     meta_count += 1;
                     if raw_single_attempt && meta_count > 1 {
                         errors.push(format!(
@@ -347,6 +641,10 @@ fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool
                     errors.push(format!(
                         "line {line_no}: unexpected @@MBENCH:CAL frame after END"
                     ));
+                } else if meta_count == 0 {
+                    errors.push(format!(
+                        "line {line_no}: @@MBENCH:CAL frame appeared before @@MBENCH:META"
+                    ));
                 }
             }
             WireFrame::Start(start) => {
@@ -356,7 +654,18 @@ fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool
                         start.id
                     ));
                 } else {
-                    open_starts.push(start);
+                    if meta_count == 0 {
+                        errors.push(format!(
+                            "line {line_no}: @@MBENCH:START frame appeared before @@MBENCH:META ('{}')",
+                            start.id
+                        ));
+                    }
+                    let id = start.id.clone();
+                    if !tracker.record_start(start) {
+                        errors.push(format!(
+                            "line {line_no}: duplicate open @@MBENCH:START frame for '{id}'"
+                        ));
+                    }
                 }
             }
             WireFrame::Check(chk) => {
@@ -366,11 +675,22 @@ fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool
                         chk.id
                     ));
                 } else {
-                    if let Some(pos) = open_starts
-                        .iter()
-                        .position(|s| s.kind == StartKind::Check && s.id == chk.id)
+                    if meta_count == 0 && !chk.synthetic {
+                        errors.push(format!(
+                            "line {line_no}: @@MBENCH:CHECK frame appeared before @@MBENCH:META ('{}')",
+                            chk.id
+                        ));
+                    }
+                    let had_start = tracker.close_check(&chk.id);
+                    if raw_single_attempt
+                        && !had_start
+                        && chk.status != CheckStatusTag::Skipped
+                        && !chk.synthetic
                     {
-                        open_starts.remove(pos);
+                        errors.push(format!(
+                            "line {line_no}: CHECK frame '{}' ({:?}) without matching @@MBENCH:START",
+                            chk.id, chk.status
+                        ));
                     }
                     if raw_single_attempt {
                         if let Some(prev_line) = seen_check_keys.insert(chk.id.clone(), line_no) {
@@ -379,8 +699,9 @@ fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool
                                 chk.id
                             ));
                         }
-                        raw_checks.push(chk);
+                        raw_checks.push(chk.clone());
                     }
+                    merge_check_into(&mut check_order, &mut check_map, chk);
                 }
             }
             WireFrame::Bench(bench) => {
@@ -390,12 +711,22 @@ fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool
                         bench.id
                     ));
                 } else {
-                    if let Some(pos) = open_starts.iter().position(|s| {
-                        s.kind == StartKind::Bench
-                            && s.id == bench.id
-                            && s.parallel == bench.parallel
-                    }) {
-                        open_starts.remove(pos);
+                    if meta_count == 0 && !bench.synthetic {
+                        errors.push(format!(
+                            "line {line_no}: @@MBENCH:BENCH frame appeared before @@MBENCH:META ('{}')",
+                            bench.id
+                        ));
+                    }
+                    let had_start = tracker.close_bench(&bench.id, bench.parallel);
+                    if raw_single_attempt
+                        && !had_start
+                        && bench.status != BenchStatusTag::Skipped
+                        && !bench.synthetic
+                    {
+                        errors.push(format!(
+                            "line {line_no}: BENCH frame '{}' (parallel={}, {:?}) without matching @@MBENCH:START",
+                            bench.id, bench.parallel, bench.status
+                        ));
                     }
                     if raw_single_attempt {
                         let key = (bench.id.clone(), bench.parallel);
@@ -405,40 +736,46 @@ fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool
                                 bench.id, bench.parallel
                             ));
                         }
-                        raw_benches.push(*bench);
+                        raw_benches.push((*bench).clone());
                     }
+                    merge_bench_into(&mut bench_order, &mut bench_map, *bench);
                 }
             }
-            WireFrame::End(end) => {
+            WireFrame::End(end_rec) => {
                 if saw_end {
                     errors.push(format!("line {line_no}: duplicate @@MBENCH:END frame"));
                 } else {
                     saw_end = true;
-                    for unclosed in open_starts.drain(..) {
+                    end = Some(end_rec);
+                    for unclosed in tracker.drain_all() {
                         errors.push(format!(
                             "line {line_no}: unclosed @@MBENCH:START frame before END ({:?} '{}', parallel={})",
                             unclosed.kind, unclosed.id, unclosed.parallel
                         ));
                     }
                     if raw_single_attempt {
-                        let computed =
-                            summarize_records(&raw_checks, &raw_benches, end.quarantine_warnings);
+                        let computed = summarize_records(
+                            &raw_checks,
+                            &raw_benches,
+                            end_rec.quarantine_warnings,
+                        );
                         compare_end_counts(
                             &format!("line {line_no}"),
                             &computed,
-                            &end,
+                            &end_rec,
                             &mut errors,
                         );
                     }
                 }
             }
-            WireFrame::Panic(_) => {
+            WireFrame::Panic(p) => {
                 if saw_end {
                     errors.push(format!(
                         "line {line_no}: unexpected @@MBENCH:PANIC frame after END"
                     ));
                 }
                 saw_panic = true;
+                panic = Some(p);
             }
         }
     }
@@ -450,7 +787,7 @@ fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool
         if !saw_end {
             errors.push(String::from("missing @@MBENCH:END frame"));
         }
-        for unclosed in open_starts {
+        for unclosed in tracker.drain_all() {
             errors.push(format!(
                 "unclosed @@MBENCH:START frame at EOF ({:?} '{}', parallel={})",
                 unclosed.kind, unclosed.id, unclosed.parallel
@@ -458,7 +795,64 @@ fn audit_stream_lines(lines: &[&str], raw_single_attempt: bool, expect_end: bool
         }
     }
 
-    errors
+    StreamAuditResult {
+        errors,
+        any_frame_seen,
+        env,
+        attempts,
+        meta,
+        panic,
+        end,
+        saw_panic,
+        checks: finalize_check_order(check_order, &mut check_map),
+        benches: finalize_bench_order(bench_order, &mut bench_map),
+    }
+}
+
+fn merge_check_into(
+    order: &mut Vec<String>,
+    map: &mut BTreeMap<String, CheckFrame>,
+    chk: CheckFrame,
+) {
+    if chk.skip_reason == Some(SkipReason::ResumedPast) && map.contains_key(&chk.id) {
+        return;
+    }
+    if !map.contains_key(&chk.id) {
+        order.push(chk.id.clone());
+    }
+    map.insert(chk.id.clone(), chk);
+}
+
+fn merge_bench_into(
+    order: &mut Vec<(String, usize)>,
+    map: &mut BTreeMap<(String, usize), BenchFrame>,
+    bench: BenchFrame,
+) {
+    let key = (bench.id.clone(), bench.parallel);
+    if bench.skip_reason == Some(SkipReason::ResumedPast) && map.contains_key(&key) {
+        return;
+    }
+    if !map.contains_key(&key) {
+        order.push(key.clone());
+    }
+    map.insert(key, bench);
+}
+
+fn finalize_check_order(
+    order: Vec<String>,
+    map: &mut BTreeMap<String, CheckFrame>,
+) -> Vec<CheckFrame> {
+    order.into_iter().filter_map(|id| map.remove(&id)).collect()
+}
+
+fn finalize_bench_order(
+    order: Vec<(String, usize)>,
+    map: &mut BTreeMap<(String, usize), BenchFrame>,
+) -> Vec<BenchFrame> {
+    order
+        .into_iter()
+        .filter_map(|key| map.remove(&key))
+        .collect()
 }
 
 fn compare_end_counts(
@@ -592,7 +986,9 @@ mod tests {
 
     fn check_line(id: &str, status: CheckStatus) -> String {
         let mut out = String::new();
-        protocol::write_start_line(StartKind::Check, id, 1, &mut out).unwrap();
+        if !matches!(status, CheckStatus::Skipped(_)) {
+            protocol::write_start_line(StartKind::Check, id, 1, &mut out).unwrap();
+        }
         let failed = matches!(status, CheckStatus::Failed(_)) as u64;
         protocol::write_check_line(
             &CheckResult {
@@ -613,7 +1009,9 @@ mod tests {
 
     fn bench_line(id: &str, group: BenchGroup, parallel: usize, status: BenchStatus) -> String {
         let mut out = String::new();
-        protocol::write_start_line(StartKind::Bench, id, parallel, &mut out).unwrap();
+        if !matches!(status, BenchStatus::Skipped(_)) {
+            protocol::write_start_line(StartKind::Bench, id, parallel, &mut out).unwrap();
+        }
         let cyc = (status == BenchStatus::Pass)
             .then(|| stats::compute_stats(&[100, 101, 99, 100, 102], 1, 0, 0));
         protocol::write_bench_line(
@@ -650,13 +1048,17 @@ mod tests {
     }
 
     #[test]
-    fn audits_raw_captures_and_detects_protocol_defects() {
+    fn audits_raw_captures_and_retains_valid_facts_on_parse_errors() {
         let mut cal = String::new();
         protocol::write_cal_line(&CalibrationRecord::default(), &mut cal).unwrap();
 
         let mut ok_log = sample_meta(4, SbiCapMask::BASE | SbiCapMask::HSM);
         ok_log.push_str(&cal);
         ok_log.push_str(&check_line("conformance/base", CheckStatus::Pass));
+        ok_log.push_str(&check_line(
+            "conformance/time",
+            CheckStatus::Skipped(SkipReason::FilteredOut),
+        ));
         ok_log.push_str(&check_line(
             "conformance/rfnc",
             CheckStatus::Failed(FailReason::UnexpectedSbiError(-2)),
@@ -674,11 +1076,11 @@ mod tests {
             BenchStatus::Failed(FailReason::Timeout),
         ));
         ok_log.push_str(&end_line(EndRecord {
-            checks_total: 2,
+            checks_total: 3,
             checks_passed: 1,
-            checks_skipped: 0,
+            checks_skipped: 1,
             checks_failed: 1,
-            check_assertions_total: 10,
+            check_assertions_total: 15,
             check_assertions_passed: 5,
             check_assertions_failed: 1,
             benches_total: 2,
@@ -690,13 +1092,13 @@ mod tests {
             quarantine_warnings: 0,
         }));
 
-        // Valid wire protocol with failing cases still produces a clean, complete report.
         let report = audit_capture("ok", &ok_log);
         assert_eq!(report.format, CaptureFormat::RawSerial);
         assert!(report.protocol_valid, "{:?}", report.protocol_errors);
         assert!(report.completed);
         assert!(!report.recovered);
         assert_eq!(report.counts.checks_failed, 1);
+        assert_eq!(report.counts.checks_skipped, 1);
         assert_eq!(report.counts.benches_failed, 1);
         assert_eq!(report.counts.benches_effective, 1);
         assert_eq!(
@@ -704,93 +1106,154 @@ mod tests {
             vec![SbiExtensionId::Base, SbiExtensionId::Hsm]
         );
 
-        // Unclosed START before END fails protocol validation.
-        let mut unclosed = sample_meta(1, SbiCapMask::BASE);
-        protocol::write_start_line(StartKind::Check, "conformance/base", 1, &mut unclosed).unwrap();
-        unclosed.push_str(&end_line(EndRecord::default()));
-        let unclosed_report = audit_capture("unclosed", &unclosed);
-        assert!(!unclosed_report.protocol_valid);
-        assert!(
-            unclosed_report
-                .protocol_errors
-                .iter()
-                .any(|e| e.contains("unclosed @@MBENCH:START"))
-        );
-
-        // Trailing frame after END and duplicate END must be caught.
-        let mut trailing = ok_log.clone();
-        trailing.push_str(&check_line("conformance/extra", CheckStatus::Pass));
-        trailing.push_str(&end_line(EndRecord::default()));
-        let trailing_report = audit_capture("trailing", &trailing);
-        assert!(!trailing_report.protocol_valid);
-        assert!(
-            trailing_report
-                .protocol_errors
-                .iter()
-                .any(|e| e.contains("after END"))
-        );
-        assert!(
-            trailing_report
-                .protocol_errors
-                .iter()
-                .any(|e| e.contains("duplicate @@MBENCH:END"))
-        );
-
-        // Malformed or truncated @@MBENCH lines must be flagged.
-        let malformed = format!("{}\n@@MBENCH:BOGUS\n", sample_meta(1, SbiCapMask::BASE));
-        let malformed_report = audit_capture("malformed", &malformed);
-        assert!(!malformed_report.protocol_valid);
-        assert!(!malformed_report.completed);
-
-        // Mismatched raw END count must be flagged even when JSON parses cleanly.
-        let mut mismatch = sample_meta(1, SbiCapMask::BASE);
-        mismatch.push_str(&check_line("conformance/base", CheckStatus::Pass));
-        mismatch.push_str(&end_line(EndRecord::default()));
-        let mismatch_report = audit_capture("mismatch", &mismatch);
-        assert!(!mismatch_report.protocol_valid);
-        assert!(
-            mismatch_report
-                .protocol_errors
-                .iter()
-                .any(|e| e.contains("checks_total"))
-        );
-    }
-
-    #[test]
-    fn merged_report_preserves_attempt_errors_and_recovery_markers() {
-        let mut merged_bad = String::from(
-            "# MBENCH_ENV {\"clock_regime\":\"qemu-tcg-non-cycle-accurate\",\"label\":\"fw\",\"smp\":4}\n",
-        );
-        merged_bad.push_str(&sample_meta(4, SbiCapMask::BASE));
-        merged_bad.push_str(&check_line("conformance/base", CheckStatus::Pass));
-        let bad_attempt = AttemptRecord {
-            attempt: 0,
-            resume_after: None,
-            saw_end: true,
-            shutdown: ShutdownStatus::CleanExit,
-            protocol_errors: vec![String::from("line 3: malformed wire frame")],
-            synthesized_failures: Vec::new(),
-        };
-        merged_bad.push_str(&format!(
-            "# MBENCH_ATTEMPT {}\n",
-            serde_json::to_string(&bad_attempt).unwrap()
-        ));
-        merged_bad.push_str(&end_line(EndRecord {
+        // One truncated frame mid-stream must NOT discard meta, surviving checks/benches, or end.
+        let mut partial_corrupt = sample_meta(4, SbiCapMask::BASE);
+        partial_corrupt.push_str(&check_line("conformance/base", CheckStatus::Pass));
+        partial_corrupt
+            .push_str("@@MBENCH:START {\"kind\":\"bench\",\"id\":\"base/probe\",\"parallel\":1}\n");
+        partial_corrupt.push_str("@@MBENCH:BENCH {\"id\":\"base/probe\",\"group\":\"base\"\n");
+        partial_corrupt.push_str(&end_line(EndRecord {
             checks_total: 1,
             checks_passed: 1,
             check_assertions_total: 5,
             check_assertions_passed: 5,
             ..EndRecord::default()
         }));
+        let corrupt_report = audit_capture("corrupt-mid", &partial_corrupt);
+        assert!(!corrupt_report.protocol_valid);
+        assert!(corrupt_report.meta.is_some());
+        assert_eq!(corrupt_report.checks.len(), 1);
+        assert_eq!(corrupt_report.checks[0].id, "conformance/base");
+        assert_eq!(corrupt_report.counts.checks_passed, 1);
+        assert!(corrupt_report.end.is_some());
+        assert!(corrupt_report.completed);
 
-        let bad_report = audit_capture("merged-bad", &merged_bad);
-        assert_eq!(bad_report.format, CaptureFormat::MergedJsonl);
-        assert!(!bad_report.protocol_valid);
+        // Non-SKIPPED CHECK or BENCH without matching START must fail protocol audit.
+        let mut missing_start = sample_meta(1, SbiCapMask::BASE);
+        missing_start.push_str("@@MBENCH:CHECK {\"id\":\"conformance/base\",\"checks\":1,\"checks_total\":1,\"status\":\"PASS\"}\n");
+        missing_start.push_str("@@MBENCH:BENCH {\"id\":\"base/get_spec_version\",\"group\":\"base\",\"mode\":\"batched\",\"parallel\":1,\"unit\":\"call\",\"iters_per_trial\":16,\"trials\":5,\"status\":\"PASS\"}\n");
+        missing_start.push_str(&end_line(EndRecord {
+            checks_total: 1,
+            checks_passed: 1,
+            check_assertions_total: 1,
+            check_assertions_passed: 1,
+            benches_total: 1,
+            benches_passed: 1,
+            ..EndRecord::default()
+        }));
+        let missing_start_report = audit_capture("missing-start", &missing_start);
+        assert!(!missing_start_report.protocol_valid);
         assert!(
-            bad_report
+            missing_start_report
                 .protocol_errors
                 .iter()
-                .any(|e| e.contains("attempt 0: line 3: malformed wire frame"))
+                .any(|e| e.contains("CHECK frame") && e.contains("without matching @@MBENCH:START"))
+        );
+        assert!(
+            missing_start_report
+                .protocol_errors
+                .iter()
+                .any(|e| e.contains("BENCH frame") && e.contains("without matching @@MBENCH:START"))
+        );
+
+        // Records emitted before META must fail ordering checks.
+        let mut before_meta = String::new();
+        before_meta.push_str(&check_line("conformance/base", CheckStatus::Pass));
+        before_meta.push_str(&sample_meta(1, SbiCapMask::BASE));
+        before_meta.push_str(&end_line(EndRecord {
+            checks_total: 1,
+            checks_passed: 1,
+            check_assertions_total: 5,
+            check_assertions_passed: 5,
+            ..EndRecord::default()
+        }));
+        let before_meta_report = audit_capture("before-meta", &before_meta);
+        assert!(!before_meta_report.protocol_valid);
+        assert!(
+            before_meta_report
+                .protocol_errors
+                .iter()
+                .any(|e| e.contains("before @@MBENCH:META"))
+        );
+    }
+
+    #[test]
+    fn audits_multi_attempt_raw_log_with_boundaries_and_retains_errors() {
+        let mut multi_raw = String::from("# MBENCH_RAW_ATTEMPT {\"attempt\":0}\n");
+        multi_raw.push_str(&sample_meta(1, SbiCapMask::BASE));
+        multi_raw.push_str(&bench_line(
+            "baseline/loop",
+            BenchGroup::Baseline,
+            1,
+            BenchStatus::Pass,
+        ));
+        multi_raw.push_str(
+            "@@MBENCH:START {\"kind\":\"bench\",\"id\":\"baseline/counter\",\"parallel\":1}\n",
+        );
+        multi_raw.push_str("@@MBENCH:BENCH {\"id\":\"baseline/counter\",\"group\":\"baseline\"\n");
+
+        multi_raw.push_str(
+            "# MBENCH_RAW_ATTEMPT {\"attempt\":1,\"resume_after\":\"baseline/counter\"}\n",
+        );
+        multi_raw.push_str(&sample_meta(1, SbiCapMask::BASE));
+        multi_raw.push_str(&bench_line(
+            "baseline/loop",
+            BenchGroup::Baseline,
+            1,
+            BenchStatus::Skipped(SkipReason::ResumedPast),
+        ));
+        multi_raw.push_str(&bench_line(
+            "baseline/counter",
+            BenchGroup::Baseline,
+            1,
+            BenchStatus::Skipped(SkipReason::ResumedPast),
+        ));
+        multi_raw.push_str(&bench_line(
+            "baseline/s_trap",
+            BenchGroup::Baseline,
+            1,
+            BenchStatus::Pass,
+        ));
+        multi_raw.push_str(&end_line(EndRecord {
+            benches_total: 3,
+            benches_passed: 1,
+            benches_skipped: 2,
+            ..EndRecord::default()
+        }));
+
+        let rep = audit_capture("multi-raw", &multi_raw);
+        assert_eq!(rep.format, CaptureFormat::RawSerial);
+        assert!(!rep.protocol_valid);
+        assert!(rep.completed);
+        assert!(rep.recovered);
+        assert!(rep.meta.is_some());
+        assert_eq!(rep.counts.benches_passed, 2);
+        assert_eq!(rep.counts.benches_skipped, 1);
+        assert!(
+            rep.protocol_errors
+                .iter()
+                .any(|e| e.starts_with("attempt 0:"))
+        );
+        assert!(
+            !rep.protocol_errors
+                .iter()
+                .any(|e| e.contains("duplicate @@MBENCH:META")),
+            "second attempt META must not be flagged as duplicate META: {:?}",
+            rep.protocol_errors
+        );
+
+        // Two META frames inside the same attempt boundary still fail.
+        let mut dup_meta_raw = String::from("# MBENCH_RAW_ATTEMPT {\"attempt\":0}\n");
+        dup_meta_raw.push_str(&sample_meta(1, SbiCapMask::BASE));
+        dup_meta_raw.push_str(&sample_meta(1, SbiCapMask::BASE));
+        dup_meta_raw.push_str(&end_line(EndRecord::default()));
+        let dup_rep = audit_capture("dup-meta", &dup_meta_raw);
+        assert!(!dup_rep.protocol_valid);
+        assert!(
+            dup_rep
+                .protocol_errors
+                .iter()
+                .any(|e| e.contains("duplicate @@MBENCH:META frame"))
         );
 
         let mut merged_recovered = String::from(
@@ -804,7 +1267,7 @@ mod tests {
             attempt: 0,
             resume_after: None,
             saw_end: false,
-            shutdown: ShutdownStatus::TimedOutDuringRun,
+            shutdown: ShutdownStatus::Interrupted,
             protocol_errors: Vec::new(),
             synthesized_failures: vec![String::from("conformance/time")],
         };
@@ -812,43 +1275,18 @@ mod tests {
             "# MBENCH_ATTEMPT {}\n",
             serde_json::to_string(&a0).unwrap()
         ));
-        merged_recovered.push_str(&check_line("conformance/base", CheckStatus::Pass));
-        let a1 = AttemptRecord {
-            attempt: 1,
-            resume_after: Some(String::from("conformance/time")),
-            saw_end: true,
-            shutdown: ShutdownStatus::HostTerminatedAfterEnd,
-            protocol_errors: Vec::new(),
-            synthesized_failures: Vec::new(),
-        };
-        merged_recovered.push_str(&format!(
-            "# MBENCH_ATTEMPT {}\n",
-            serde_json::to_string(&a1).unwrap()
-        ));
-        merged_recovered.push_str(&end_line(EndRecord {
-            checks_total: 2,
-            checks_passed: 1,
-            checks_failed: 1,
-            check_assertions_total: 6,
-            check_assertions_passed: 5,
-            check_assertions_failed: 1,
-            ..EndRecord::default()
-        }));
-
-        let rec_report = audit_capture("merged-rec", &merged_recovered);
+        let rec_report = audit_capture("interrupted", &merged_recovered);
         assert!(
-            rec_report.protocol_valid,
-            "{:?}",
-            rec_report.protocol_errors
+            rec_report
+                .protocol_errors
+                .iter()
+                .any(|e| e.contains("missing @@MBENCH:END"))
         );
-        assert!(rec_report.completed);
+        assert!(!rec_report.protocol_valid);
+        assert!(!rec_report.completed);
         assert!(rec_report.recovered);
-        assert!(rec_report.checks[0].synthetic);
-        assert!(!rec_report.checks[1].synthetic);
-        assert_eq!(rec_report.attempts.len(), 2);
-        assert_eq!(
-            rec_report.attempts[1].shutdown,
-            ShutdownStatus::HostTerminatedAfterEnd
-        );
+        assert!(rec_report.meta.is_some());
+        assert_eq!(rec_report.checks.len(), 1);
+        assert_eq!(rec_report.attempts[0].shutdown, ShutdownStatus::Interrupted);
     }
 }
