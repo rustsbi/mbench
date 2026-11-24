@@ -11,11 +11,11 @@ use crate::{
     mbench_loop,
     platform::{
         Platform,
-        shmem::{DbtrAcquire, dbtr_exec_target_addr, dbtr_scratch_addr},
+        shmem::{DbtrAcquire, dbtr_exec_target_addr, dbtr_scratch_addr, pick_match_trigger},
     },
     sbi::{
         self, SbiError,
-        dbtr::{TriggerAccess, TriggerData, TriggerKind, build_smode_match_tdata1},
+        dbtr::{TriggerAccess, TriggerData},
     },
 };
 
@@ -73,8 +73,11 @@ fn run_dbtr_set_shmem(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> Fini
         if dis.error != 0 && sbi::error_code(dis) != SbiError::NoShmem.as_code() {
             return Err(FailReason::UnexpectedSbiError(sbi::error_code(dis)));
         }
+        if let Err(err) = s.ensure_shmem_clean() {
+            return Err(FailReason::UnexpectedSbiError(sbi::error_code(err)));
+        }
         let t0 = s.snap_begin();
-        let en = s.enable_shmem();
+        let en = s.enable_shmem_measured();
         let t1 = s.snap_end();
         if en.error != 0 {
             return Err(FailReason::UnexpectedSbiError(sbi::error_code(en)));
@@ -119,20 +122,8 @@ fn sample_match_trigger_data() -> Result<Option<TriggerData>, FailReason> {
         (TriggerAccess::Load, dbtr_scratch_addr()),
         (TriggerAccess::Exec, dbtr_exec_target_addr()),
     ] {
-        for kind in [TriggerKind::Mcontrol6, TriggerKind::Mcontrol] {
-            let tdata1 = build_smode_match_tdata1(kind, access);
-            let ret = sbi::dbtr::num_triggers(tdata1);
-            if ret.error != 0 {
-                return Err(FailReason::UnexpectedSbiError(sbi::error_code(ret)));
-            }
-            if ret.value > 0 {
-                return Ok(Some(TriggerData {
-                    tstate: 0,
-                    tdata1,
-                    tdata2: addr,
-                    tdata3: 0,
-                }));
-            }
+        if let Some(data) = pick_match_trigger(access, addr)? {
+            return Ok(Some(data));
         }
     }
     Ok(None)

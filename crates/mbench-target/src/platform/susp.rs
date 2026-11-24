@@ -9,6 +9,12 @@ use crate::{
     sbi,
 };
 
+/// Saved BSP register context used by the non-retentive system-suspend trampoline.
+///
+/// # Invariants
+///
+/// - Field order is an ABI with the assembly offsets exported in `global_asm!` below.
+/// - `ra` is at offset `0`; every field is a register-width `usize` and the block is 64-byte aligned.
 #[repr(C, align(64))]
 struct SuspContext {
     ra: usize,
@@ -33,6 +39,9 @@ struct SuspContext {
     resumed_satp: usize,
     resumed_sstatus: usize,
 }
+
+const _: () = assert!(offset_of!(SuspContext, ra) == 0);
+const _: () = assert!(align_of::<SuspContext>() == 64);
 
 impl SuspContext {
     const fn new() -> Self {

@@ -1,49 +1,22 @@
-//! Single-owner SBI Hart State Management (`HSM`) lifecycle probes and suspend worker.
+//! HSM secondary-hart suspend probes and the single-owner suspend worker.
 
-use core::{
-    arch::naked_asm,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use core::{arch::naked_asm, sync::atomic::Ordering};
 
 use mbench_core::{
     engine::{Clock, CounterSnap},
-    record::{CounterAvailability, FailReason, HartTopology},
+    record::FailReason,
 };
-use riscv::register::{sie, sip, sstatus};
+use riscv::register::{sie, sip};
 
+use super::{
+    HSM_DONE_EPOCH, HSM_ERR, HSM_RESUME_HART, HSM_RESUME_OPAQUE, HSM_RESUME_READY, HSM_RESUME_SATP,
+    HSM_RESUME_SSTATUS, HSM_RESUME_VIA, HSM_STOP_REQUESTED, HSM_SUSPEND_EPOCH, HSM_SUSPEND_TYPE,
+    MAX_SPIN_POLLS, send_ipi_single, stop_current_worker_hart, wait_hart_state,
+};
 use crate::{
-    platform::{Platform, boot, counters},
+    platform::{Platform, boot, counters, impl_platform_clock_topology},
     sbi,
 };
-
-static HSM_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
-static HSM_SUSPEND_EPOCH: AtomicUsize = AtomicUsize::new(0);
-static HSM_DONE_EPOCH: AtomicUsize = AtomicUsize::new(0);
-static HSM_ERR: AtomicUsize = AtomicUsize::new(0);
-static HSM_SUSPEND_TYPE: AtomicUsize = AtomicUsize::new(0);
-static HSM_RESUME_READY: AtomicUsize = AtomicUsize::new(0);
-static HSM_PROBE_ACK: AtomicUsize = AtomicUsize::new(0);
-
-static HSM_CONF_DONE: AtomicUsize = AtomicUsize::new(0);
-static HSM_CONF_HART: AtomicUsize = AtomicUsize::new(0);
-static HSM_CONF_OPAQUE: AtomicUsize = AtomicUsize::new(0);
-static HSM_CONF_SATP: AtomicUsize = AtomicUsize::new(usize::MAX);
-static HSM_CONF_SSTATUS: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-static HSM_RESUME_VIA: AtomicUsize = AtomicUsize::new(0);
-static HSM_RESUME_HART: AtomicUsize = AtomicUsize::new(0);
-static HSM_RESUME_OPAQUE: AtomicUsize = AtomicUsize::new(0);
-static HSM_RESUME_SATP: AtomicUsize = AtomicUsize::new(usize::MAX);
-static HSM_RESUME_SSTATUS: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-/// Captured S-mode entry state observed on a newly started secondary hart.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct HsmHandoffSnapshot {
-    pub(crate) hart_id: usize,
-    pub(crate) opaque: usize,
-    pub(crate) satp: usize,
-    pub(crate) sstatus: usize,
-}
 
 /// Wakeup expectation for secondary `sbi_hart_suspend` probes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,169 +37,11 @@ pub(crate) struct HsmSuspendProbe {
     pub(crate) expected_opaque: usize,
 }
 
-/// Probes duplicate `sbi_hart_start` on the already-running boot hart (`AlreadyAvailable`).
-pub(crate) fn probe_duplicate_start_boot_hart(platform: &mut Platform) -> sbi::SbiRet {
-    let boot_hart_id = platform.info().boot_hart_id;
-    // SAFETY: `boot_hart_id` is already STARTED, so M-mode rejects starting it with `AlreadyAvailable`;
-    // `mbench_hsm_conf_entry` is a valid S-mode entry symbol.
-    unsafe { sbi::hsm::hart_start(boot_hart_id, mbench_hsm_conf_entry as *const () as usize, 0) }
-}
-
-/// Starts `peer_hart_id` with `magic_opaque`, captures its initial S-mode registers, and waits for `STOPPED`.
-pub(crate) fn probe_secondary_handoff(
-    platform: &mut Platform,
-    peer_hart_id: usize,
-    magic_opaque: usize,
-    timeout_ticks: u64,
-) -> Result<HsmHandoffSnapshot, FailReason> {
-    if platform.harts.is_poisoned()
-        || platform.harts.online_harts_count() != 1
-        || platform.harts.dedicated_worker_active()
-    {
-        return Err(FailReason::HardwareInconsistent);
-    }
-    let has_time = platform.availability().has_time;
-    wait_hart_state(
-        peer_hart_id,
-        sbi::hsm::state::STOPPED,
-        has_time,
-        timeout_ticks,
-    )?;
-    platform.harts.claim_dedicated_worker(peer_hart_id)?;
-    HSM_CONF_DONE.store(0, Ordering::Release);
-
-    // SAFETY: `peer_hart_id` is verified `STOPPED` and exclusively claimed; stack slot 1 is owned until `STOPPED`.
-    let ret = unsafe {
-        sbi::hsm::hart_start(
-            peer_hart_id,
-            mbench_hsm_conf_entry as *const () as usize,
-            magic_opaque,
-        )
-    };
-    if ret.error != 0 {
-        platform.harts.release_dedicated_worker();
-        return Err(FailReason::UnexpectedSbiError(sbi::error_code(ret)));
-    }
-
-    if let Err(err) = counters::wait_until(has_time, timeout_ticks, 50_000_000, || {
-        HSM_CONF_DONE.load(Ordering::Acquire) == 1
-    }) {
-        platform.harts.mark_poisoned();
-        return Err(err);
-    }
-    if let Err(err) = wait_hart_state(
-        peer_hart_id,
-        sbi::hsm::state::STOPPED,
-        has_time,
-        timeout_ticks,
-    ) {
-        platform.harts.mark_poisoned();
-        return Err(err);
-    }
-    platform.harts.release_dedicated_worker();
-
-    Ok(HsmHandoffSnapshot {
-        hart_id: HSM_CONF_HART.load(Ordering::Acquire),
-        opaque: HSM_CONF_OPAQUE.load(Ordering::Acquire),
-        satp: HSM_CONF_SATP.load(Ordering::Acquire),
-        sstatus: HSM_CONF_SSTATUS.load(Ordering::Acquire),
-    })
-}
-
-/// Measures one `sbi_hart_start` -> secondary entry acknowledgement cycle and waits for `STOPPED`.
-pub(crate) fn probe_start_stop_sample(
-    platform: &mut Platform,
-    peer_hart_id: usize,
-    timeout_ticks: u64,
-) -> Result<CounterSnap, FailReason> {
-    if platform.harts.is_poisoned()
-        || platform.harts.online_harts_count() != 1
-        || platform.harts.dedicated_worker_active()
-    {
-        return Err(FailReason::HardwareInconsistent);
-    }
-    let has_time = platform.availability().has_time;
-    wait_hart_state(
-        peer_hart_id,
-        sbi::hsm::state::STOPPED,
-        has_time,
-        timeout_ticks,
-    )?;
-    platform.harts.claim_dedicated_worker(peer_hart_id)?;
-    HSM_PROBE_ACK.store(0, Ordering::Release);
-    let stack_top = boot::worker_stack_top(1);
-
-    let t0 = platform.snap_begin();
-    // SAFETY: `peer_hart_id` is STOPPED and `stack_top` (slot 1) is exclusively claimed via `HsmHartPool`.
-    let ret = unsafe {
-        sbi::hsm::hart_start(
-            peer_hart_id,
-            mbench_hsm_probe_entry as *const () as usize,
-            stack_top,
-        )
-    };
-    if ret.error != 0 {
-        platform.harts.release_dedicated_worker();
-        return Err(FailReason::UnexpectedSbiError(sbi::error_code(ret)));
-    }
-    if let Err(err) = counters::wait_until(has_time, timeout_ticks, 50_000_000, || {
-        HSM_PROBE_ACK.load(Ordering::Acquire) == 1
-    }) {
-        platform.harts.mark_poisoned();
-        return Err(err);
-    }
-    let t1 = platform.snap_end();
-    if let Err(err) = wait_hart_state(
-        peer_hart_id,
-        sbi::hsm::state::STOPPED,
-        has_time,
-        timeout_ticks,
-    ) {
-        platform.harts.mark_poisoned();
-        return Err(err);
-    }
-    platform.harts.release_dedicated_worker();
-    Ok(CounterSnap::delta(t1, t0))
-}
-
-/// Polls `sbi_hart_get_status(hart_id)` until the hart reaches `wanted` state or times out.
-pub(crate) fn wait_hart_state(
-    hart_id: usize,
-    wanted: usize,
-    has_time: bool,
-    timeout_ticks: u64,
-) -> Result<(), FailReason> {
-    let start = if has_time {
-        counters::read_time_raw()
-    } else {
-        0
-    };
-    let mut spins = 0u64;
-    loop {
-        let ret = sbi::hsm::hart_get_status(hart_id);
-        if ret.error != 0 {
-            return Err(FailReason::UnexpectedSbiError(sbi::error_code(ret)));
-        }
-        if ret.value == wanted {
-            return Ok(());
-        }
-        if has_time {
-            if counters::read_time_raw().wrapping_sub(start) > timeout_ticks {
-                return Err(FailReason::Timeout);
-            }
-        } else {
-            spins += 1;
-            if spins > 50_000_000 {
-                return Err(FailReason::Timeout);
-            }
-        }
-        core::hint::spin_loop();
-    }
-}
-
 /// Single-instance RAII secondary worker for retentive / non-retentive `sbi_hart_suspend` benchmarks.
 ///
 /// Holds `&mut Platform` exclusively so no concurrent HSM probes or parallel workers can contend for slot 1.
+#[clippy::has_significant_drop]
+#[must_use = "HsmSuspendWorker should be finished explicitly to report worker teardown errors"]
 pub(crate) struct HsmSuspendWorker<'a> {
     platform: &'a mut Platform,
     peer_hart_id: usize,
@@ -268,6 +83,7 @@ impl<'a> HsmSuspendWorker<'a> {
 
         let stack_top = boot::worker_stack_top(1);
         // SAFETY: `peer_hart_id` is STOPPED and slot 1 / HSM statics are exclusively claimed via `HsmHartPool`.
+        // CAST: RISC-V entry PC is a `usize`; the symbol is a valid executable S-mode address.
         let ret = unsafe {
             sbi::hsm::hart_start(
                 peer_hart_id,
@@ -289,7 +105,7 @@ impl<'a> HsmSuspendWorker<'a> {
             active: true,
         };
 
-        if let Err(err) = counters::wait_until(has_time, timeout_ticks, 50_000_000, || {
+        if let Err(err) = counters::wait_until(has_time, timeout_ticks, MAX_SPIN_POLLS, || {
             HSM_RESUME_READY.load(Ordering::Acquire) == 1
         }) {
             let _ = worker.teardown_inner();
@@ -300,7 +116,7 @@ impl<'a> HsmSuspendWorker<'a> {
         worker.next_epoch = 1;
         HSM_SUSPEND_EPOCH.store(worker.next_epoch, Ordering::Release);
         let mut saw_suspended = false;
-        let _ = counters::wait_until(has_time, timeout_ticks / 4, 50_000_000, || {
+        let _ = counters::wait_until(has_time, timeout_ticks / 4, MAX_SPIN_POLLS, || {
             if HSM_DONE_EPOCH.load(Ordering::Acquire) == worker.next_epoch {
                 return true;
             }
@@ -323,7 +139,7 @@ impl<'a> HsmSuspendWorker<'a> {
                 let _ = worker.teardown_inner();
                 return Err(FailReason::UnexpectedSbiError(sbi::error_code(ipi)));
             }
-            if let Err(err) = counters::wait_until(has_time, timeout_ticks, 50_000_000, || {
+            if let Err(err) = counters::wait_until(has_time, timeout_ticks, MAX_SPIN_POLLS, || {
                 HSM_DONE_EPOCH.load(Ordering::Acquire) == worker.next_epoch
             }) {
                 let _ = worker.teardown_inner();
@@ -348,6 +164,8 @@ impl<'a> HsmSuspendWorker<'a> {
     pub(crate) fn measure_wake_sample(&mut self) -> Result<CounterSnap, FailReason> {
         self.next_epoch = self.next_epoch.wrapping_add(1);
         let ep = self.next_epoch;
+        // INVARIANT: `wrapping_add` is intentional; the epoch compares fully, and only its exact
+        // value is used to match a single suspend/wake round.
         HSM_SUSPEND_EPOCH.store(ep, Ordering::Release);
         wait_hart_state(
             self.peer_hart_id,
@@ -361,7 +179,7 @@ impl<'a> HsmSuspendWorker<'a> {
         if ret.error != 0 {
             return Err(FailReason::UnexpectedSbiError(sbi::error_code(ret)));
         }
-        counters::wait_until(self.has_time, self.timeout_ticks, 50_000_000, || {
+        counters::wait_until(self.has_time, self.timeout_ticks, MAX_SPIN_POLLS, || {
             HSM_DONE_EPOCH.load(Ordering::Acquire) == ep
         })?;
         let t1 = self.platform.snap_end();
@@ -410,92 +228,7 @@ impl Drop for HsmSuspendWorker<'_> {
     }
 }
 
-impl Clock for HsmSuspendWorker<'_> {
-    fn snap_begin(&self) -> CounterSnap {
-        self.platform.snap_begin()
-    }
-
-    fn snap_end(&self) -> CounterSnap {
-        self.platform.snap_end()
-    }
-
-    fn read_cycles(&self) -> u64 {
-        self.platform.read_cycles()
-    }
-
-    fn read_ticks(&self) -> u64 {
-        self.platform.read_ticks()
-    }
-
-    fn availability(&self) -> CounterAvailability {
-        self.platform.availability()
-    }
-
-    fn timebase_hz(&self) -> u64 {
-        self.platform.timebase_hz()
-    }
-}
-
-impl HartTopology for HsmSuspendWorker<'_> {
-    fn total_harts(&self) -> usize {
-        self.platform.total_harts()
-    }
-}
-
-fn send_ipi_single(hart_id: usize) -> sbi::SbiRet {
-    sbi::spi::send_ipi(1usize << (hart_id & 63), hart_id & !63)
-}
-
-fn stop_current_worker_hart() -> ! {
-    // SAFETY: Running exclusively on the dedicated worker hart right before calling `hart_stop`.
-    unsafe {
-        sstatus::clear_sie();
-        sie::write(sie::Sie::from_bits(0));
-        sip::clear_ssoft();
-        let _ = sbi::hsm::hart_stop();
-    }
-    loop {
-        riscv::asm::wfi();
-    }
-}
-
-/// Naked secondary entry point for short start/stop latency probing.
-///
-/// # Safety
-///
-/// Must only be invoked by SBI `hart_start(peer_hart_id, entry, stack_top)` with a valid
-/// slot-1 stack top in `a1` while BSP holds exclusive ownership of `HSM_PROBE_ACK`.
-#[unsafe(naked)]
-unsafe extern "C" fn mbench_hsm_probe_entry(_hart_id: usize, stack_top: usize) -> ! {
-    naked_asm!(
-        "mv sp, a1",
-        "csrci sstatus, 2",
-        "csrw sie, zero",
-        "j {rust_fn}",
-        rust_fn = sym hsm_probe_rust,
-    );
-}
-
-extern "C" fn hsm_probe_rust() -> ! {
-    HSM_PROBE_ACK.store(1, Ordering::Release);
-    stop_current_worker_hart()
-}
-
-/// Naked secondary entry point launching [`hsm_suspend_worker_rust`].
-///
-/// # Safety
-///
-/// Must only be invoked by SBI `hart_start` while BSP holds an active [`HsmSuspendWorker`].
-#[unsafe(naked)]
-unsafe extern "C" fn mbench_hsm_suspend_entry(_hart_id: usize, stack_top: usize) -> ! {
-    naked_asm!(
-        "mv sp, a1",
-        "csrci sstatus, 2",
-        "csrw sie, zero",
-        "j {rust_fn}",
-        rust_fn = sym hsm_suspend_worker_rust,
-    );
-}
+impl_platform_clock_topology!(HsmSuspendWorker<'_>);
 
 /// Probes a single `sbi_hart_suspend` invocation on `peer_hart_id` and returns observed wakeup state.
 pub(crate) fn probe_secondary_suspend(
@@ -534,6 +267,7 @@ pub(crate) fn probe_secondary_suspend(
 
     let stack_top = boot::worker_stack_top(1);
     // SAFETY: `peer_hart_id` is STOPPED and slot 1 is exclusively claimed via `HsmHartPool`.
+    // CAST: RISC-V entry PC is a `usize`; the symbol is a valid executable S-mode address.
     let start_ret = unsafe {
         sbi::hsm::hart_start(
             peer_hart_id,
@@ -546,7 +280,7 @@ pub(crate) fn probe_secondary_suspend(
         return Err(FailReason::SecondaryHartError(sbi::error_code(start_ret)));
     }
 
-    let wait_ready = counters::wait_until(has_time, timeout_ticks, 50_000_000, || {
+    let wait_ready = counters::wait_until(has_time, timeout_ticks, MAX_SPIN_POLLS, || {
         HSM_RESUME_READY.load(Ordering::Acquire) == 1
     });
     if wait_ready.is_err() {
@@ -566,7 +300,7 @@ pub(crate) fn probe_secondary_suspend(
     let mut wake_ipi_err: Option<FailReason> = None;
     if wake_mode == SuspendWakeMode::WakeViaIpi {
         let mut saw_suspended = false;
-        let _ = counters::wait_until(has_time, timeout_ticks / 4, 50_000_000, || {
+        let _ = counters::wait_until(has_time, timeout_ticks / 4, MAX_SPIN_POLLS, || {
             if HSM_DONE_EPOCH.load(Ordering::Acquire) == 1 {
                 return true;
             }
@@ -588,11 +322,13 @@ pub(crate) fn probe_secondary_suspend(
     let wait_done = if wake_ipi_err.is_some() {
         Err(FailReason::Timeout)
     } else {
-        counters::wait_until(has_time, timeout_ticks, 50_000_000, || {
+        counters::wait_until(has_time, timeout_ticks, MAX_SPIN_POLLS, || {
             HSM_DONE_EPOCH.load(Ordering::Acquire) == 1
         })
     };
     let err_code = HSM_ERR.load(Ordering::Acquire) as isize;
+    // INVARIANT: The resume fields are written before `HSM_RESUME_VIA` (Release) and read
+    // after the corresponding `Acquire` in `hsm_resumed_rust` / below.
     let probe = HsmSuspendProbe {
         err_code,
         resumed_via_trampoline: HSM_RESUME_VIA.load(Ordering::Acquire) == 1,
@@ -626,6 +362,22 @@ pub(crate) fn probe_secondary_suspend(
     }
     platform.harts.release_dedicated_worker();
     Ok(probe)
+}
+
+/// Naked secondary entry point launching [`hsm_suspend_worker_rust`].
+///
+/// # Safety
+///
+/// Must only be invoked by SBI `hart_start` while BSP holds an active [`HsmSuspendWorker`].
+#[unsafe(naked)]
+unsafe extern "C" fn mbench_hsm_suspend_entry(_hart_id: usize, stack_top: usize) -> ! {
+    naked_asm!(
+        "mv sp, a1",
+        "csrci sstatus, 2",
+        "csrw sie, zero",
+        "j {rust_fn}",
+        rust_fn = sym hsm_suspend_worker_rust,
+    );
 }
 
 /// Naked non-retentive suspend resume trampoline capturing entry CSRs/regs and restoring `sp`.
@@ -687,6 +439,7 @@ fn hsm_suspend_loop(mut seen_epoch: usize) -> ! {
                 sie::set_ssoft();
             }
             // SAFETY: `mbench_hsm_resume_entry` and `stack_top` (slot 1) remain valid until stop.
+            // CAST: RISC-V resume PC is a `usize`; the symbol is a valid executable S-mode address.
             let ret = unsafe {
                 sbi::hsm::hart_suspend(
                     stype,
@@ -706,32 +459,4 @@ fn hsm_suspend_loop(mut seen_epoch: usize) -> ! {
         }
         core::hint::spin_loop();
     }
-}
-
-/// Naked entry point verifying SBI M->S handoff CSR/ABI state (`satp`, `sstatus`, `a0`, `a1`).
-///
-/// # Safety
-///
-/// Must only be invoked by SBI `hart_start` during [`probe_secondary_handoff`] when slot 1 stack
-/// (`2 * HART_STACK_SIZE`) is exclusively available.
-#[unsafe(naked)]
-unsafe extern "C" fn mbench_hsm_conf_entry(_hart_id: usize, _opaque: usize) -> ! {
-    naked_asm!(
-        "csrr a2, satp",
-        "csrr a3, sstatus",
-        "la   sp, {worker_stacks} + {offset}",
-        "j    {rust_fn}",
-        worker_stacks = sym boot::WORKER_STACKS,
-        offset = const 2 * boot::HART_STACK_SIZE,
-        rust_fn = sym hsm_conf_rust,
-    );
-}
-
-extern "C" fn hsm_conf_rust(hart_id: usize, opaque: usize, satp: usize, sstatus_bits: usize) -> ! {
-    HSM_CONF_HART.store(hart_id, Ordering::Relaxed);
-    HSM_CONF_OPAQUE.store(opaque, Ordering::Relaxed);
-    HSM_CONF_SATP.store(satp, Ordering::Relaxed);
-    HSM_CONF_SSTATUS.store(sstatus_bits, Ordering::Relaxed);
-    HSM_CONF_DONE.store(1, Ordering::Release);
-    stop_current_worker_hart()
 }

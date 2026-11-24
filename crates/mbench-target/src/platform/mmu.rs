@@ -8,6 +8,13 @@ use crate::platform::boot::SyncUnsafeCell;
 const PT_ENTRIES: usize = 512;
 const PAGE_SIZE: usize = 4096;
 const SV39_ASID: usize = 1;
+const SV39_INDEX_MASK: usize = PT_ENTRIES - 1;
+const SV39_L2_SHIFT: usize = 30;
+const SV39_L1_SHIFT: usize = 21;
+const SV39_L0_SHIFT: usize = 12;
+const PTE_PPN_SHIFT: usize = 10;
+const PPN_PER_GIGAPAGE: usize = 1 << 18;
+const PPN_PER_MEGAPAGE: usize = 1 << 9;
 
 bitflags! {
     /// RISC-V Sv39 page table entry permission and status flags (OSTD layout).
@@ -37,6 +44,8 @@ struct TargetPage([u8; PAGE_SIZE]);
 const _: () = assert!(PT_ENTRIES == 512);
 const _: () = assert!(PAGE_SIZE == (1 << 12));
 const _: () = assert!(size_of::<PageTable>() == PAGE_SIZE);
+const _: () = assert!(size_of::<TargetPage>() == PAGE_SIZE);
+const _: () = assert!(SV39_INDEX_MASK == 0x1ff);
 
 static L2_PT: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; PT_ENTRIES]));
 static L1_PT: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; PT_ENTRIES]));
@@ -47,7 +56,7 @@ static RFENCE_ALT_PAGE: SyncUnsafeCell<TargetPage> =
     SyncUnsafeCell::new(TargetPage([0xA5; PAGE_SIZE]));
 
 const fn encode_pte(ppn: usize, flags: PteFlags) -> usize {
-    (ppn << 10) | flags.bits()
+    (ppn << PTE_PPN_SHIFT) | flags.bits()
 }
 
 /// Validated static Sv39 configuration constructed at boot and applied across harts via [`SatpTarget`].
@@ -81,8 +90,8 @@ pub(in crate::platform) enum SatpTarget {
 /// Must be called once by the BSP before any secondary harts activate Sv39.
 pub(crate) unsafe fn init_sv39_identity_table() -> Sv39Config {
     let target_page = RFENCE_TARGET_PAGE.get().cast::<u8>() as usize;
-    let l2_idx = (target_page >> 30) & 0x1ff;
-    let l1_idx = (target_page >> 21) & 0x1ff;
+    let l2_idx = (target_page >> SV39_L2_SHIFT) & SV39_INDEX_MASK;
+    let l1_idx = (target_page >> SV39_L1_SHIFT) & SV39_INDEX_MASK;
 
     // SAFETY: Called once by BSP with exclusive access to static page tables.
     unsafe {
@@ -92,23 +101,35 @@ pub(crate) unsafe fn init_sv39_identity_table() -> Sv39Config {
 
         // Map 0..512 GiB as 1 GiB gigapages so code, stacks, DTB, and MMIO remain accessible.
         for (i, entry) in l2.0.iter_mut().enumerate() {
-            *entry = encode_pte(i << 18, PteFlags::LEAF);
+            *entry = encode_pte(i * PPN_PER_GIGAPAGE, PteFlags::LEAF);
         }
 
         // Split the 1 GiB region containing `RFENCE_TARGET_PAGE` down to 2 MiB megapages.
         for (j, entry) in l1.0.iter_mut().enumerate() {
-            *entry = encode_pte((l2_idx << 18) | (j << 9), PteFlags::LEAF);
+            *entry = encode_pte(
+                (l2_idx * PPN_PER_GIGAPAGE) | (j * PPN_PER_MEGAPAGE),
+                PteFlags::LEAF,
+            );
         }
-        l2.0[l2_idx] = encode_pte((l1 as *const PageTable as usize) >> 12, PteFlags::VALID);
+        l2.0[l2_idx] = encode_pte(
+            (l1 as *const PageTable as usize) >> SV39_L0_SHIFT,
+            PteFlags::VALID,
+        );
 
         // Split the 2 MiB region containing `RFENCE_TARGET_PAGE` down to genuine 4 KiB leaves.
         for (k, entry) in l0.0.iter_mut().enumerate() {
-            *entry = encode_pte((l2_idx << 18) | (l1_idx << 9) | k, PteFlags::LEAF);
+            *entry = encode_pte(
+                (l2_idx * PPN_PER_GIGAPAGE) | (l1_idx * PPN_PER_MEGAPAGE) | k,
+                PteFlags::LEAF,
+            );
         }
-        l1.0[l1_idx] = encode_pte((l0 as *const PageTable as usize) >> 12, PteFlags::VALID);
+        l1.0[l1_idx] = encode_pte(
+            (l0 as *const PageTable as usize) >> SV39_L0_SHIFT,
+            PteFlags::VALID,
+        );
     }
 
-    let root_ppn = (L2_PT.get().cast::<u8>() as usize) >> 12;
+    let root_ppn = (L2_PT.get().cast::<u8>() as usize) >> SV39_L0_SHIFT;
     let mut satp = Satp::from_bits(0);
     satp.set_mode(Mode::Sv39);
     satp.set_asid(SV39_ASID);
@@ -131,8 +152,8 @@ pub(in crate::platform) const ALT_PAGE_SENTINEL: u64 = u64::from_le_bytes([0xA5;
 /// Must only be called while `Sv39Guard` is active and BSP coordinates explicit TLB flushes.
 pub(in crate::platform) unsafe fn remap_target_page_to_alt(cfg: &Sv39Config) {
     let target_va = cfg.target_page;
-    let l0_idx = (target_va >> 12) & 0x1ff;
-    let alt_ppn = (RFENCE_ALT_PAGE.get().cast::<u8>() as usize) >> 12;
+    let l0_idx = (target_va >> SV39_L0_SHIFT) & SV39_INDEX_MASK;
+    let alt_ppn = (RFENCE_ALT_PAGE.get().cast::<u8>() as usize) >> SV39_L0_SHIFT;
     // SAFETY: `L0_PT` is exclusively updated by BSP under `Sv39Guard`; `alt_ppn` is static `RFENCE_ALT_PAGE`.
     unsafe {
         core::ptr::write_volatile(
@@ -150,8 +171,8 @@ pub(in crate::platform) unsafe fn remap_target_page_to_alt(cfg: &Sv39Config) {
 /// Must only be called while `Sv39Guard` is active (or during teardown) before releasing `Sv39Guard`.
 pub(in crate::platform) unsafe fn restore_target_page_identity(cfg: &Sv39Config) {
     let target_va = cfg.target_page;
-    let l0_idx = (target_va >> 12) & 0x1ff;
-    let identity_ppn = target_va >> 12;
+    let l0_idx = (target_va >> SV39_L0_SHIFT) & SV39_INDEX_MASK;
+    let identity_ppn = target_va >> SV39_L0_SHIFT;
     // SAFETY: `L0_PT` is exclusively updated by BSP; restores identity mapping of `RFENCE_TARGET_PAGE`.
     unsafe {
         core::ptr::write_volatile(

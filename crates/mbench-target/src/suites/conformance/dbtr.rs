@@ -2,7 +2,7 @@
 
 use mbench_core::{
     check::{CheckCase, CheckCtx, CheckOutcome},
-    record::{CaseFlags, FailReason, IssueClass, SbiExtensionId, SkipReason},
+    record::{CaseFlags, IssueClass, SbiExtensionId, SkipReason},
 };
 use riscv::interrupt::{Exception, Trap};
 
@@ -11,13 +11,13 @@ use crate::{
     platform::{
         Platform,
         shmem::{
-            DbtrAcquire, DbtrSession, dbtr_exec_target_addr, dbtr_scratch_addr,
+            DbtrAcquire, DbtrSession, dbtr_exec_target_addr, dbtr_scratch_addr, pick_match_trigger,
             probe_dbtr_exec_target, probe_dbtr_load_scratch,
         },
     },
     sbi::{
         self, SbiError,
-        dbtr::{TriggerAccess, TriggerData, TriggerKind, build_smode_match_tdata1, tstate},
+        dbtr::{TriggerAccess, TriggerData, tstate},
     },
 };
 
@@ -28,28 +28,6 @@ pub(super) static CASES: &[CheckCase<Platform>] = &[check_case(
     CaseFlags::empty(),
     conf_dbtr,
 )];
-
-fn pick_match_trigger(
-    access: TriggerAccess,
-    target_addr: usize,
-) -> Result<Option<TriggerData>, FailReason> {
-    for kind in [TriggerKind::Mcontrol6, TriggerKind::Mcontrol] {
-        let tdata1 = build_smode_match_tdata1(kind, access);
-        let ret = sbi::dbtr::num_triggers(tdata1);
-        if ret.error != 0 {
-            return Err(FailReason::UnexpectedSbiError(sbi::error_code(ret)));
-        }
-        if ret.value > 0 {
-            return Ok(Some(TriggerData {
-                tstate: 0,
-                tdata1,
-                tdata2: target_addr,
-                tdata3: 0,
-            }));
-        }
-    }
-    Ok(None)
-}
 
 fn verify_trigger_lifecycle(
     ctx: &mut CheckCtx,

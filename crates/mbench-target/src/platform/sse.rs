@@ -4,14 +4,21 @@ use core::{arch::global_asm, mem::offset_of};
 
 use mbench_core::{
     engine::{Clock, CounterSnap},
-    record::{CounterAvailability, FailReason, HartTopology},
+    record::FailReason,
 };
 
 use crate::{
-    platform::{Platform, boot::SyncUnsafeCell},
+    platform::{Platform, boot::SyncUnsafeCell, impl_platform_clock_topology},
     sbi::{self, SbiError, SbiRet},
 };
 
+/// Per-event SSE trampoline record.
+///
+/// # Invariants
+///
+/// - `done` is the first field at offset `0`; `trap.S`-style assembly emits it through `OFF_DONE`.
+/// - `done` is published with release ordering after `hart_id`/`saved_*` are written.
+/// - The block stays 64-byte aligned so the trampoline never shares a cache line with unrelated data.
 #[repr(C, align(64))]
 struct SseStamp {
     done: usize,
@@ -20,6 +27,9 @@ struct SseStamp {
     saved_t1: usize,
     saved_t2: usize,
 }
+
+const _: () = assert!(offset_of!(SseStamp, done) == 0);
+const _: () = assert!(align_of::<SseStamp>() == 64);
 
 impl SseStamp {
     const fn new() -> Self {
@@ -73,6 +83,8 @@ unsafe extern "C" {
 }
 
 /// Exclusive BSP registration handle for [`sbi::sse::EVENT_LOCAL_SOFTWARE`]; unregisters on [`Drop`].
+#[clippy::has_significant_drop]
+#[must_use = "SseSession must be finished explicitly to unregister the SSE event"]
 pub(crate) struct SseSession<'a> {
     platform: &'a mut Platform,
     event_id: usize,
@@ -307,34 +319,4 @@ pub(in crate::platform) fn probe_invalid_register(event_id: usize, unaligned: bo
     unsafe { sbi::sse::register(event_id, pc, SSE_STAMP.get() as usize) }
 }
 
-impl Clock for SseSession<'_> {
-    fn snap_begin(&self) -> CounterSnap {
-        self.platform.snap_begin()
-    }
-
-    fn snap_end(&self) -> CounterSnap {
-        self.platform.snap_end()
-    }
-
-    fn read_cycles(&self) -> u64 {
-        self.platform.read_cycles()
-    }
-
-    fn read_ticks(&self) -> u64 {
-        self.platform.read_ticks()
-    }
-
-    fn availability(&self) -> CounterAvailability {
-        self.platform.availability()
-    }
-
-    fn timebase_hz(&self) -> u64 {
-        self.platform.timebase_hz()
-    }
-}
-
-impl HartTopology for SseSession<'_> {
-    fn total_harts(&self) -> usize {
-        self.platform.total_harts()
-    }
-}
+impl_platform_clock_topology!(SseSession<'_>);

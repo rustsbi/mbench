@@ -15,6 +15,11 @@ pub(crate) enum TimerMode {
 
 /// Probes whether S-mode `stimecmp` (`0x14D`) is writable without trapping.
 pub(crate) fn probe_stimecmp_writable() -> bool {
+    /// Writes `u64::MAX` to `stimecmp` to detect Sstc trap vs acceptance.
+    ///
+    /// # Safety
+    ///
+    /// Must execute inside [`trap::try_catch_raw`] with zero `Drop` locals in scope.
     unsafe extern "C" fn probe(_ctx: *mut u8) {
         // SAFETY: Pure CSR write inside `try_catch_raw` with zero `Drop` locals.
         unsafe { write_stimecmp_raw(u64::MAX) };

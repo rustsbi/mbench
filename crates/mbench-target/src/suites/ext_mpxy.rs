@@ -5,6 +5,7 @@ use mbench_core::{
     record::{BenchGroup, FailReason, SbiExtensionId, SkipReason},
 };
 
+use super::run_shmem_reregister;
 use crate::{
     mbench_loop,
     platform::{
@@ -57,22 +58,7 @@ fn run_mpxy_shmem_size(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> Fin
 }
 
 fn run_mpxy_set_shmem(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> FinishedBench {
-    let mut lease = match env.lease_shmem(ShmemOwner::Mpxy) {
-        Ok(ShmemAcquire::Leased(l)) => l,
-        Ok(ShmemAcquire::Unsupported) => return run.skip(SkipReason::FunctionUnsupported),
-        Ok(ShmemAcquire::TooLarge) => return run.skip(SkipReason::ShmemTooLarge),
-        Err(err) => return run.fail(err),
-    };
-
-    let pending = run.measure_batched(&mut lease, |l, iters| {
-        let mut errors = 0usize;
-        mbench_loop!(iters, {
-            let ret = l.reregister();
-            errors |= ret.error;
-        });
-        BatchOutcome::from_errors(errors, iters)
-    });
-    pending.finish_with(lease.finish())
+    run_shmem_reregister(env, run, ShmemOwner::Mpxy)
 }
 
 fn run_mpxy_channel_ids(env: &mut Platform, run: BenchRun<'_, '_, '_, '_>) -> FinishedBench {

@@ -22,12 +22,15 @@ use core::fmt::Write;
 use mbench_core::{
     check,
     config::{RunConfig, effective_max_harts},
-    engine::{self, BenchSpec},
+    engine::{self, BatchOutcome, BenchRun, BenchSpec, FinishedBench},
     protocol,
-    record::{BenchGroup, RunState, SbiCapMask, SbiExtensionId},
+    record::{BenchGroup, RunState, SbiCapMask, SbiExtensionId, SkipReason},
 };
 
-use crate::platform::Platform;
+use crate::platform::{
+    Platform,
+    shmem::{ShmemAcquire, ShmemOwner},
+};
 
 /// Executes `body` `iters` times with uniform loop overhead across calibration and suites.
 #[macro_export]
@@ -45,6 +48,29 @@ macro_rules! mbench_loop {
 /// Empty loop calibrated as LMbench `l_overhead`, matching [`mbench_loop!`] instruction-for-instruction.
 pub(crate) fn empty_bench_loop(iters: u64) {
     mbench_loop!(iters, {});
+}
+
+/// Measures one shared-memory registration call per batch under the owning lease.
+pub(crate) fn run_shmem_reregister(
+    env: &mut Platform,
+    run: BenchRun<'_, '_, '_, '_>,
+    owner: ShmemOwner,
+) -> FinishedBench {
+    let mut lease = match env.lease_shmem(owner) {
+        Ok(ShmemAcquire::Leased(lease)) => lease,
+        Ok(ShmemAcquire::Unsupported) => return run.skip(SkipReason::FunctionUnsupported),
+        Ok(ShmemAcquire::TooLarge) => return run.skip(SkipReason::ShmemTooLarge),
+        Err(err) => return run.fail(err),
+    };
+    let pending = run.measure_batched(&mut lease, |lease, iters| {
+        let mut errors = 0usize;
+        mbench_loop!(iters, {
+            let ret = lease.reregister();
+            errors |= ret.error;
+        });
+        BatchOutcome::from_errors(errors, iters)
+    });
+    pending.finish_with(lease.finish())
 }
 
 /// Runs the `mbench` pipeline from metadata emission through mode-selected checks, benches, and shutdown.

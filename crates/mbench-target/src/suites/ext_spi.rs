@@ -1,4 +1,4 @@
-//! SBI sPI extension benchmarks (`spi/*`) using safe [`WorkerIpiModeGuard`].
+//! SBI sPI extension benchmarks (`spi/*`) using safe [`crate::platform::WorkerIpiModeGuard`].
 
 use mbench_core::{
     engine::{

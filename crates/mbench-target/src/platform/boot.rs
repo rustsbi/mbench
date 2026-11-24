@@ -83,15 +83,29 @@ impl ApBootInfo {
     }
 }
 
+const _: () = assert!(offset_of!(ApBootInfo, stack_top) == 0);
+const _: () = assert!(offset_of!(ApBootInfo, hart_local) == size_of::<usize>());
+const _: () = assert!(offset_of!(ApBootInfo, slot_idx) == 2 * size_of::<usize>());
+
 /// Wrapper for static per-hart storage initialized before secondary harts start.
+///
+/// # Invariants
+///
+/// - `T: Send`; the wrapper only makes shared storage `Sync`, it does not create interior
+///   mutability access. Every `get()` caller must enforce per-hart partitioning or an explicit
+///   release/acquire protocol before dereferencing the returned pointer.
+/// - The pointed-to value must remain valid for the `'static` lifetime of the static.
 #[repr(transparent)]
-pub(crate) struct SyncUnsafeCell<T>(UnsafeCell<T>);
+pub(crate) struct SyncUnsafeCell<T: Send>(UnsafeCell<T>);
 
-// SAFETY: Accesses are partitioned by hart index or strictly synchronized at boot/barriers.
-unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+// SAFETY: `T: Send` matches the `Mutex<T>`/`CriticalSection` rule: the value may move across
+// execution contexts, while `get()` remains unsafe to dereference and all callers provide the
+// partitioning or synchronization described on the type.
+unsafe impl<T: Send> Sync for SyncUnsafeCell<T> {}
 
-impl<T> SyncUnsafeCell<T> {
+impl<T: Send> SyncUnsafeCell<T> {
     pub(crate) const fn new(value: T) -> Self {
+        // INVARIANT: `T: Send` and the caller's static lifetime establish the wrapper invariant.
         Self(UnsafeCell::new(value))
     }
 
@@ -121,6 +135,7 @@ const _: () = assert!(align_of::<HartLocal>() == 64);
 /// Returns the top-of-stack address for secondary worker slot `slot_idx`.
 pub(crate) fn worker_stack_top(slot_idx: usize) -> usize {
     assert!(slot_idx < MAX_HARTS, "worker slot index out of bounds");
+    // CAST: the static stack array lives in identity-mapped RAM; BSP passes a numeric stack top.
     (WORKER_STACKS.get().cast::<u8>() as usize) + (slot_idx + 1) * HART_STACK_SIZE
 }
 
@@ -144,6 +159,7 @@ pub(in crate::platform) unsafe fn prepare_ap_boot_info(slot_idx: usize) -> usize
             hart_local,
             slot_idx,
         });
+        // CAST: `sbi_hart_start` consumes the descriptor as an opaque physical pointer.
         entry_ptr as usize
     }
 }
