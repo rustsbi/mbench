@@ -18,20 +18,30 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.lints.rust]
+improper_ctypes_definitions = "warn"
 redundant_imports = "warn"
 unreachable_pub = "warn"
-unsafe_op_in_unsafe_fn = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
 unused_qualifications = "warn"
+unused_unsafe = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
 
 [workspace.lints.clippy]
 allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 dbg_macro = "warn"
 inconsistent_struct_constructor = "warn"
+missing_safety_doc = "deny"
 needless_continue = "warn"
+not_unsafe_ptr_arg_deref = "deny"
 redundant_closure_for_method_calls = "warn"
 redundant_test_prefix = "warn"
 todo = "warn"
-undocumented_unsafe_blocks = "warn"
+undocumented_unsafe_blocks = "deny"
 unimplemented = "warn"
 
 [workspace.dependencies]

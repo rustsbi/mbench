@@ -1,1 +1,5 @@
+avoid-breaking-exported-api = true
 check-inconsistent-struct-field-initializers = true
+disallowed-methods = [
+    { path = "core::mem::transmute", reason = "transmute requires explicit ABI/layout justification via #[expect(clippy::disallowed_methods, reason = \"...\")]" },
+]
