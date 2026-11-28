@@ -1,6 +1,10 @@
 //! Flattened Device Tree (FDT) discovery for hart topology, timer, ISA, reserved RAM, and UART.
 
-use fdt::Fdt;
+use dtoolkit::{
+    Node, Property,
+    fdt::{Fdt, FdtNode},
+    standard::NodeStandard,
+};
 use mbench_core::isa::{self, IsaExtensions};
 
 use crate::platform::boot::MAX_HARTS;
@@ -17,27 +21,23 @@ pub(crate) struct Uart16550Config {
 }
 
 impl Uart16550Config {
-    fn from_fdt_node(node: &fdt::node::FdtNode<'_, '_>) -> Option<Self> {
-        let reg = node.reg()?.next()?;
-        let reg_offset = node
-            .property("reg-offset")
-            .and_then(fdt::node::NodeProperty::as_usize)
-            .unwrap_or(0);
-        let base = (reg.starting_address as usize).checked_add(reg_offset)?;
+    fn from_fdt_node(node: FdtNode<'_>) -> Option<Self> {
+        if !node.is_compatible("ns16550a") && !node.is_compatible("ns16550") {
+            return None;
+        }
+        let reg = node.reg().ok()??.next()?;
+        let reg_offset = word_property(node, "reg-offset").unwrap_or(0);
+        let base = usize::try_from(reg.address::<u64>().ok()?)
+            .ok()?
+            .checked_add(reg_offset)?;
         if base == 0 {
             return None;
         }
 
-        let shift_val = node
-            .property("reg-shift")
-            .and_then(fdt::node::NodeProperty::as_usize)
-            .unwrap_or(0);
+        let shift_val = word_property(node, "reg-shift").unwrap_or(0);
         let reg_shift = u8::try_from(shift_val).ok().filter(|&s| s <= 3)?;
 
-        let width_val = node
-            .property("reg-io-width")
-            .and_then(fdt::node::NodeProperty::as_usize)
-            .unwrap_or(1);
+        let width_val = word_property(node, "reg-io-width").unwrap_or(1);
         let reg_io_width = match width_val {
             1 => 1u8,
             4 => 4u8,
@@ -51,9 +51,7 @@ impl Uart16550Config {
         }
         let min_span = (5usize << reg_shift).checked_add(width)?;
         let offset_span = reg_offset.checked_add(min_span)?;
-        if let Some(size) = reg.size
-            && offset_span > size
-        {
+        if !reg.size.as_ref().is_empty() && offset_span as u64 > reg.size::<u64>().ok()? {
             return None;
         }
         base.checked_add(min_span)?;
@@ -122,21 +120,18 @@ impl HardwareInfo {
         }
 
         // SAFETY: Caller guarantees `dtb_paddr` points to a valid FDT for `'static`.
-        let Ok(fdt) = (unsafe { Fdt::from_ptr(dtb_paddr as *const u8) }) else {
+        let Ok(fdt) = (unsafe { Fdt::from_raw(dtb_paddr as *const u8) }) else {
             return info;
         };
 
-        if let Some(chosen) = fdt.find_node("/chosen")
-            && let Some(prop) = chosen.property("bootargs")
-            && let Some(raw) = prop.as_str()
+        if let Some(chosen) = fdt.chosen()
+            && let Ok(Some(raw)) = chosen.bootargs()
         {
             info.bootargs = raw;
         }
 
         if let Some(cpus_node) = fdt.find_node("/cpus")
-            && let Some(tb) = cpus_node
-                .property("timebase-frequency")
-                .and_then(fdt::node::NodeProperty::as_usize)
+            && let Some(tb) = word_property(cpus_node, "timebase-frequency")
             && tb > 0
         {
             info.timebase_hz = tb as u64;
@@ -151,42 +146,52 @@ impl HardwareInfo {
     }
 }
 
-fn is_active_cpu(cpu: &fdt::standard_nodes::Cpu<'_, '_>) -> bool {
+fn word_property(node: FdtNode<'_>, name: &str) -> Option<usize> {
+    let prop = node.property(name)?;
+    let word = prop
+        .value_as::<u32>()
+        .map(u64::from)
+        .or_else(|_| prop.value_as::<u64>())
+        .ok()?;
+    usize::try_from(word).ok()
+}
+
+fn is_active_cpu(cpu: FdtNode<'_>) -> bool {
     let is_cpu = cpu
         .property("device_type")
-        .and_then(fdt::node::NodeProperty::as_str)
+        .and_then(|prop| prop.value_as::<&str>().ok())
         .is_none_or(|s| s == "cpu");
     let status_ok = cpu
         .property("status")
-        .and_then(fdt::node::NodeProperty::as_str)
+        .and_then(|prop| prop.value_as::<&str>().ok())
         .is_none_or(|s| s == "ok" || s == "okay");
     is_cpu && status_ok
 }
 
 fn parse_harts(fdt: &Fdt<'_>, boot_hart_id: usize, info: &mut HardwareInfo) {
-    let any_has_mmu = fdt
-        .cpus()
-        .filter(is_active_cpu)
-        .any(|cpu| cpu.property("mmu-type").is_some());
+    let Ok(cpus) = fdt.cpus() else { return };
+    let active_cpus = || {
+        cpus.cpus()
+            .map(|cpu| *cpu)
+            .filter(|cpu| is_active_cpu(*cpu))
+    };
+    let any_has_mmu = active_cpus().any(|cpu| cpu.property("mmu-type").is_some());
 
     let mut common_isa = IsaExtensions::all();
     let mut saw_cpu = false;
     let mut count = 1usize;
     info.hart_ids[0] = boot_hart_id;
 
-    for cpu in fdt.cpus().filter(is_active_cpu) {
+    for cpu in active_cpus() {
         if any_has_mmu && cpu.property("mmu-type").is_none() {
             continue;
         }
-        let Some(hart_id) = cpu
-            .property("reg")
-            .and_then(fdt::node::NodeProperty::as_usize)
-        else {
+        let Some(hart_id) = word_property(cpu, "reg") else {
             continue;
         };
 
         saw_cpu = true;
-        common_isa &= detect_cpu_isa(&cpu);
+        common_isa &= detect_cpu_isa(cpu);
 
         if hart_id != boot_hart_id && count < MAX_HARTS {
             info.hart_ids[count] = hart_id;
@@ -204,14 +209,14 @@ fn parse_harts(fdt: &Fdt<'_>, boot_hart_id: usize, info: &mut HardwareInfo) {
     info.has_h_ext = info.isa.has_h_ext();
 }
 
-fn detect_cpu_isa(cpu: &fdt::standard_nodes::Cpu<'_, '_>) -> IsaExtensions {
+fn detect_cpu_isa(cpu: FdtNode<'_>) -> IsaExtensions {
     let mut exts = IsaExtensions::empty();
     if let Some(ext_prop) = cpu.property("riscv,isa-extensions") {
-        exts |= isa::parse_isa_extensions_list(ext_prop.value);
+        exts |= isa::parse_isa_extensions_list(ext_prop.value());
     }
     if let Some(isa_str) = cpu
         .property("riscv,isa")
-        .and_then(fdt::node::NodeProperty::as_str)
+        .and_then(|prop| prop.value_as::<&str>().ok())
     {
         exts |= isa::parse_isa_string(isa_str);
     }
@@ -223,69 +228,65 @@ fn parse_reserved_memory(fdt: &Fdt<'_>) -> (u64, Option<usize>) {
     let mut explicit_mmode: Option<usize> = None;
 
     for res in fdt.memory_reservations() {
-        total = total.saturating_add(res.size() as u64);
+        total = total.saturating_add(res.size());
     }
 
     if let Some(node) = fdt.find_node("/reserved-memory") {
         for child in node.children() {
             let has_no_map = child.property("no-map").is_some();
-            let is_mmode_node = child.name.starts_with("mmode_resv");
-            if let Some(regs) = child.reg() {
+            let is_mmode_node = child.name().starts_with("mmode_resv");
+            if let Ok(Some(regs)) = child.reg() {
                 for reg in regs {
-                    let addr = reg.starting_address as usize;
+                    let Ok(size) = reg.size::<u64>() else {
+                        continue;
+                    };
                     if has_no_map
                         && is_mmode_node
                         && explicit_mmode.is_none()
+                        && size > 0
+                        && let Ok(addr) = reg.address::<u64>()
+                        && let Ok(addr) = usize::try_from(addr)
                         && addr != 0
-                        && reg.size.is_some_and(|s| s > 0)
                     {
                         explicit_mmode = Some(addr);
                     }
-                    if let Some(size) = reg.size {
-                        total = total.saturating_add(size as u64);
-                    }
+                    total = total.saturating_add(size);
                 }
             }
         }
     }
 
-    if explicit_mmode.is_none() && is_qemu_virt_board(fdt) {
+    if explicit_mmode.is_none() && fdt.root().is_compatible("riscv-virtio") {
         explicit_mmode = Some(QEMU_VIRT_MMODE_BASE);
     }
 
     (total, explicit_mmode)
 }
 
-fn is_qemu_virt_board(fdt: &Fdt<'_>) -> bool {
-    let Some(root) = fdt.find_node("/") else {
-        return false;
-    };
-    root.compatible()
-        .is_some_and(|compat| compat.all().any(|name| name == "riscv-virtio"))
-}
-
 fn parse_uart16550(fdt: &Fdt<'_>) -> Option<Uart16550Config> {
-    if let Some(stdout) = fdt.chosen().stdout()
-        && is_ns16550(&stdout)
-        && let Some(cfg) = Uart16550Config::from_fdt_node(&stdout)
-    {
-        return Some(cfg);
+    fn find_uart(node: FdtNode<'_>, depth_left: usize) -> Option<Uart16550Config> {
+        Uart16550Config::from_fdt_node(node).or_else(|| {
+            let child_depth = depth_left.checked_sub(1)?;
+            node.children()
+                .find_map(|child| find_uart(child, child_depth))
+        })
     }
 
-    for node in fdt.all_nodes() {
-        if is_ns16550(&node)
-            && let Some(cfg) = Uart16550Config::from_fdt_node(&node)
-        {
-            return Some(cfg);
-        }
-    }
-    None
-}
-
-fn is_ns16550(node: &fdt::node::FdtNode<'_, '_>) -> bool {
-    node.compatible().is_some_and(|compat| {
-        compat
-            .all()
-            .any(|name| name == "ns16550a" || name == "ns16550")
-    })
+    let stdout = fdt.chosen().and_then(|chosen| {
+        let stdout_path = chosen.stdout_path().ok()??;
+        let path = stdout_path.split(':').next()?;
+        let absolute = if path.starts_with('/') {
+            path
+        } else {
+            fdt.find_node("/aliases")?
+                .property(path)?
+                .value_as::<&str>()
+                .ok()?
+        };
+        fdt.find_node(absolute)
+    });
+    stdout
+        .and_then(Uart16550Config::from_fdt_node)
+        // Bound recursion on the boot hart while looking for an optional console.
+        .or_else(|| find_uart(fdt.root(), 63))
 }

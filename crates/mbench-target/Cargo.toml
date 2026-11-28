@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 bitflags.workspace = true
-fdt.workspace = true
+dtoolkit.workspace = true
 mbench-core.workspace = true
 riscv.workspace = true
 sbi-rt.workspace = true

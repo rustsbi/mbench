@@ -49,7 +49,7 @@ anofox-statistics = "0.10.1"
 bitflags = { version = "2.9", default-features = false }
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = { version = "3.4", features = ["termination"] }
-fdt = "0.1.5"
+dtoolkit = "0.5.0"
 mbench-core = { path = "crates/mbench-core" }
 riscv = { version = "0.15.0", features = ["s-mode"] }
 sbi-rt = { version = "0.0.3", features = ["legacy", "integer-impls"] }
