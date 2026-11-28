@@ -188,16 +188,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtoolkit"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92bf83b2e0ec7e0c267f6fea4f49c1beab10d65f9c04532edcebeb7a4a0cc1d6"
+dependencies = [
+ "thiserror",
+ "zerocopy",
+ "zerocopy-derive",
+]
+
+[[package]]
 name = "embedded-hal"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
-
-[[package]]
-name = "fdt"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "784a4df722dc6267a04af36895398f59d21d07dce47232adf31ec0ff2fa45e67"
 
 [[package]]
 name = "getrandom"
@@ -276,7 +281,7 @@ name = "mbench-target"
 version = "0.1.0"
 dependencies = [
  "bitflags",
- "fdt",
+ "dtoolkit",
  "mbench-core",
  "riscv",
  "sbi-rt",
